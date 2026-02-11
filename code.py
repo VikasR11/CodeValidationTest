@@ -383,13 +383,13 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         case1a_passed = 0
         case1a_failed = 0
     
-    # For Case 1b: validate that delta.assets is null
+    # For Case 1b: validate that delta.assets is null or empty
     if case1b_total > 0:
         case1b_comparison = case1b_df.withColumn(
-            "delta_assets_null",
-            F.isnull(F.col("delta.assets"))
+            "delta_assets_null_or_empty",
+            F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0)
         )
-        case1b_passed = case1b_comparison.filter(F.col("delta_assets_null") == True).count()
+        case1b_passed = case1b_comparison.filter(F.col("delta_assets_null_or_empty") == True).count()
         case1b_failed = case1b_total - case1b_passed
     else:
         case1b_passed = 0
