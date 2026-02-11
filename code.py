@@ -204,3 +204,55 @@ def compare_legacy_vs_delta_chunked(legacy_df: DataFrame, delta_df: DataFrame, p
     results["execution_time_seconds"] = time.time() - start_time
     print(f"\n{'='*60}\n✓ ALL PASSED ({results['execution_time_seconds']:.2f}s)\n{'='*60}")
     return results
+
+
+def compare_legacy_vs_delta_subset(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, sample_size: int = 1000, materialize_inputs: bool = True) -> Dict:
+    """
+    Validate on a small subset - useful for testing transformation logic on complex DataFrames.
+    
+    Use this to verify your transformation script is correct before attempting full validation.
+    
+    Args:
+        legacy_df: Source of truth DataFrame
+        delta_df: Target DataFrame (can be transformed parquet)
+        primary_key: Primary key column name
+        sample_size: Number of rows to validate (default: 1000)
+        materialize_inputs: Cache inputs (default: True)
+    
+    Returns:
+        Dict with validation results on subset
+    """
+    start_time = time.time()
+    print(f"\n{'='*60}")
+    print(f"SUBSET VALIDATION: {sample_size} rows")
+    print(f"Testing transformation logic on small sample...")
+    print(f"{'='*60}\n")
+    
+    # Take a small sample from legacy
+    print(f"Sampling {sample_size} rows from legacy...")
+    legacy_subset = legacy_df.limit(sample_size)
+    
+    # Get the PKs from the sample
+    print("Extracting matching rows from delta...")
+    subset_pks = legacy_subset.select(primary_key)
+    delta_subset = delta_df.join(subset_pks, on=primary_key, how="inner")
+    
+    # Validate the subset
+    print(f"\nValidating {sample_size} row subset...\n")
+    result = compare_legacy_vs_delta(legacy_subset, delta_subset, primary_key, materialize_inputs)
+    
+    result["subset_validation"] = True
+    result["sample_size"] = sample_size
+    
+    print(f"\n{'='*60}")
+    if result["overall_validation_passed"]:
+        print(f"✓ SUBSET VALIDATION PASSED")
+        print(f"Transformation logic appears correct on {sample_size} rows.")
+        print(f"Consider running full chunked validation next.")
+    else:
+        print(f"❌ SUBSET VALIDATION FAILED")
+        print(f"Fix transformation logic before attempting full validation.")
+    print(f"Time: {result['execution_time_seconds']:.2f}s")
+    print(f"{'='*60}\n")
+    
+    return result
