@@ -5,46 +5,33 @@ from pyspark import StorageLevel
 from typing import Dict
 import time
 
-'''
-Case 1: legacy.assets is null/empty/missing
-Case 1a: legacy.assets is null/empty AND qualifying INCOME exists
 
-"Qualifying INCOME" = INCOME structs with non-null ASSETS_AMOUNT or UNTAXED_INCOME_AMOUNT
-Expected: delta.assets should contain mapped structs from those qualifying INCOME structs
-Mapping: INCOME fields → assets fields
-
-INCM_SOURCE → assets_source
-INCOME_CHANNEL_NAME → assets_channel_name
-STRATEGY_NAME → assets_strategy_name
-INCOME_LAST_MODIFIED_SOURCE_SYSTEM → assets_last_modified_source_system
-INCOME_REPORTED_TS → assets_reported_utc_timestamp
-ASSETS_AMOUNT → assets_amount
-UNTAXED_INCOME_AMOUNT → untaxed_income_amount
-
-
-
-Case 1b: legacy.assets is null/empty AND no qualifying INCOME
-
-No INCOME structs have non-null ASSETS_AMOUNT or UNTAXED_INCOME_AMOUNT
-OR ASSETS_AMOUNT/UNTAXED_INCOME_AMOUNT fields don't exist in schema
-Expected: delta.assets should be null or empty
-
-Case 2: legacy.assets is valid (not null/empty)
-
-Expected: delta.assets should match legacy.assets exactly (order-insensitive)
-'''
-
-
-def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, materialize_inputs: bool = True) -> Dict:
-    """Validate delta DataFrame matches legacy DataFrame (source of truth)."""
+def compare_legacy_vs_delta(
+    legacy_df: DataFrame,
+    delta_df: DataFrame,
+    primary_key: str,
+    num_partitions: int = 0
+) -> Dict:
+    """
+    Validate delta matches legacy with order-insensitive array/struct comparison.
+    
+    Args:
+        legacy_df: Source DataFrame
+        delta_df: Target DataFrame  
+        primary_key: Primary key column
+        num_partitions: Repartition count (0 = skip, use 300-400 for large data)
+    
+    Returns:
+        Dict with validation results
+    """
     start_time = time.time()
     
-    if materialize_inputs:
-        legacy_df.persist(StorageLevel.MEMORY_AND_DISK)
-        delta_df.persist(StorageLevel.MEMORY_AND_DISK)
+    print(f"\n{'='*70}")
+    print(f"VALIDATION - Order-Insensitive Comparison")
+    print(f"{'='*70}\n")
     
-    excluded_columns = ['assets', 'INCOME']
-    income_to_assets_mapping = {
+    # Mappings
+    income_to_assets = {
         'INCM_SOURCE': 'assets_source',
         'INCOME_CHANNEL_NAME': 'assets_channel_name',
         'STRATEGY_NAME': 'assets_strategy_name',
@@ -54,234 +41,251 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         'UNTAXED_INCOME_AMOUNT': 'untaxed_income_amount',
     }
     
-    results = {"step1_pk_validation": {}, "step2_content_validation": {}, "step3_assets_income_validation": {}, "overall_validation_passed": True, "execution_time_seconds": 0}
+    excluded = {'assets', 'INCOME'}
+    shared_cols = list((set(legacy_df.columns) & set(delta_df.columns)) - {primary_key} - excluded)
+    has_assets = "assets" in legacy_df.columns
     
-    # STEP 1: PK Validation
-    print("Step 1: PK Validation...")
-    missing = legacy_df.select(primary_key).subtract(delta_df.select(primary_key)).first()
-    extra = delta_df.select(primary_key).subtract(legacy_df.select(primary_key)).first()
-    pks_match = not (missing is not None or extra is not None)
+    results = {
+        "step1_pk_validation": {},
+        "step2_content_validation": {},
+        "step3_assets_income_validation": {},
+        "overall_validation_passed": True,
+        "execution_time_seconds": 0
+    }
     
-    results["step1_pk_validation"] = {"passed": pks_match}
-    if not pks_match:
-        results["overall_validation_passed"] = False
-        results["execution_time_seconds"] = time.time() - start_time
-        legacy_df.unpersist()
-        delta_df.unpersist()
-        print("Step 1 FAILED")
-        return results
-    print("Step 1 PASSED")
-    
-    # STEP 2: Content Validation
-    print("Step 2: Content Validation...")
-    shared_cols = (set(legacy_df.columns) & set(delta_df.columns)) - {primary_key} - set(excluded_columns)
-    joined_df = legacy_df.alias("legacy").join(delta_df.alias("delta"), on=primary_key, how="inner").coalesce(200)
-    joined_df.persist(StorageLevel.MEMORY_AND_DISK)
-    
-    def create_comparison_expr(col_name: str, df: DataFrame) -> F.col:
-        col_type = [f.dataType for f in df.schema.fields if f.name == col_name][0]
-        
-        if isinstance(col_type, ArrayType):
-            if col_name == "HOUSING":
-                fields = sorted([f.name for f in col_type.elementType.fields])
-                fs = ", ".join([f"x.`{f}` as `{f}`" for f in fields])
-                return (F.expr(f"array_sort(transform(`legacy`.`{col_name}`, x -> to_json(struct({fs}))))") == F.expr(f"array_sort(transform(`delta`.`{col_name}`, x -> to_json(struct({fs}))))")) | (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
-            elif isinstance(col_type.elementType, StructType):
-                fields = sorted([f.name for f in col_type.elementType.fields])
-                fs = ", ".join([f"x.`{f}` as `{f}`" for f in fields])
-                return (F.expr(f"array_sort(transform(`legacy`.`{col_name}`, x -> to_json(struct({fs}))))") == F.expr(f"array_sort(transform(`delta`.`{col_name}`, x -> to_json(struct({fs}))))")) | (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
-            else:
-                return (F.array_sort(F.col(f"legacy.{col_name}")) == F.array_sort(F.col(f"delta.{col_name}"))) | (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
-        elif isinstance(col_type, StructType):
-            fields = sorted([f.name for f in col_type.fields])
-            fs_leg = ", ".join([f"`legacy`.`{col_name}`.`{f}` as `{f}`" for f in fields])
-            fs_del = ", ".join([f"`delta`.`{col_name}`.`{f}` as `{f}`" for f in fields])
-            return (F.expr(f"to_json(struct({fs_leg}))") == F.expr(f"to_json(struct({fs_del}))")) | (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
-        else:
-            return (F.col(f"legacy.{col_name}") == F.col(f"delta.{col_name}")) | (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
-    
-    comparison_conditions = [create_comparison_expr(c, legacy_df) for c in shared_cols]
-    
-    if comparison_conditions:
-        all_match = comparison_conditions[0]
-        for cond in comparison_conditions[1:]:
-            all_match = all_match & cond
-        mismatched = joined_df.withColumn("content_matches", all_match).filter(F.col("content_matches") == False).first()
-        has_mismatches = (mismatched is not None)
+    # Optional repartition
+    if num_partitions > 0:
+        print(f"Repartitioning to {num_partitions} partitions...")
+        leg = legacy_df.repartition(num_partitions, primary_key)
+        dlt = delta_df.repartition(num_partitions, primary_key)
+        leg.persist(StorageLevel.MEMORY_AND_DISK)
+        dlt.persist(StorageLevel.MEMORY_AND_DISK)
     else:
-        has_mismatches = False
-        mismatched = None
+        print("Using original partitioning")
+        leg = legacy_df
+        dlt = delta_df
     
-    results["step2_content_validation"] = {"passed": not has_mismatches}
-    if has_mismatches:
+    # ========== STEP 1: PK VALIDATION ==========
+    print("\nStep 1: PK Validation...")
+    
+    pk_outer = leg.select(primary_key).alias("l").join(
+        dlt.select(primary_key).alias("d"),
+        on=primary_key,
+        how="outer"
+    ).select(
+        F.when(F.col(f"l.{primary_key}").isNull(), F.lit("extra"))
+         .when(F.col(f"d.{primary_key}").isNull(), F.lit("missing"))
+         .otherwise(F.lit("ok")).alias("status")
+    )
+    
+    pk_fail = pk_outer.filter(F.col("status") != "ok").first()
+    
+    results["step1_pk_validation"] = {"passed": pk_fail is None}
+    
+    if pk_fail:
+        print("❌ Step 1 FAILED")
         results["overall_validation_passed"] = False
-        print("Step 2 FAILED")
-        if mismatched:
-            sd = mismatched.asDict()
-            print(f"Sample (PK: {sd[primary_key]})")
-            print("Legacy:", {c: sd.get(f'legacy.{c}') for c in shared_cols})
-            print("Delta:", {c: sd.get(f'delta.{c}') for c in shared_cols})
         results["execution_time_seconds"] = time.time() - start_time
-        joined_df.unpersist()
-        legacy_df.unpersist()
-        delta_df.unpersist()
+        if num_partitions > 0:
+            leg.unpersist()
+            dlt.unpersist()
         return results
-    print("Step 2 PASSED")
     
-    # STEP 3: Assets/INCOME Validation
-    print("Step 3: Assets/INCOME Validation...")
-    legacy_has_assets = "assets" in legacy_df.columns
+    print("✓ Step 1 PASSED")
     
+    # ========== STEP 2: CONTENT VALIDATION ==========
+    print("\nStep 2: Content Validation...")
+    
+    if not shared_cols:
+        print("No shared columns")
+        results["step2_content_validation"] = {"passed": True}
+        joined = None
+    else:
+        joined = leg.alias("legacy").join(dlt.alias("delta"), on=primary_key, how="inner")
+        
+        # Build comparison for each column type
+        comparisons = []
+        
+        # Get schema once
+        schema_map = {f.name: f.dataType for f in legacy_df.schema.fields}
+        
+        for col in shared_cols:
+            col_type = schema_map[col]
+            
+            if isinstance(col_type, ArrayType) and isinstance(col_type.elementType, StructType):
+                # Array of structs - sort fields, serialize, sort array
+                if col == "HOUSING":
+                    fields = sorted([f.name for f in col_type.elementType.fields])
+                else:
+                    fields = sorted([f.name for f in col_type.elementType.fields])
+                
+                fs = ", ".join([f"x.`{f}` as `{f}`" for f in fields])
+                comp = (
+                    F.expr(f"array_sort(transform(`legacy`.`{col}`, x -> to_json(struct({fs}))))") ==
+                    F.expr(f"array_sort(transform(`delta`.`{col}`, x -> to_json(struct({fs}))))"))
+                )
+                comparisons.append(comp | (F.col(f"legacy.{col}").isNull() & F.col(f"delta.{col}").isNull()))
+                
+            elif isinstance(col_type, ArrayType):
+                # Simple array - just sort
+                comparisons.append(
+                    (F.array_sort(F.col(f"legacy.{col}")) == F.array_sort(F.col(f"delta.{col}"))) |
+                    (F.col(f"legacy.{col}").isNull() & F.col(f"delta.{col}").isNull())
+                )
+                
+            elif isinstance(col_type, StructType):
+                # Struct - sort fields, serialize
+                fields = sorted([f.name for f in col_type.fields])
+                leg_fs = ", ".join([f"`legacy`.`{col}`.`{f}` as `{f}`" for f in fields])
+                dlt_fs = ", ".join([f"`delta`.`{col}`.`{f}` as `{f}`" for f in fields])
+                comparisons.append(
+                    (F.expr(f"to_json(struct({leg_fs}))") == F.expr(f"to_json(struct({dlt_fs}))")) |
+                    (F.col(f"legacy.{col}").isNull() & F.col(f"delta.{col}").isNull())
+                )
+                
+            else:
+                # Primitive - direct comparison
+                comparisons.append(
+                    (F.col(f"legacy.{col}") == F.col(f"delta.{col}")) |
+                    (F.col(f"legacy.{col}").isNull() & F.col(f"delta.{col}").isNull())
+                )
+        
+        # Combine all comparisons
+        if comparisons:
+            all_match = comparisons[0]
+            for c in comparisons[1:]:
+                all_match = all_match & c
+            
+            mismatch = joined.filter(~all_match).first()
+            
+            results["step2_content_validation"] = {"passed": mismatch is None}
+            
+            if mismatch:
+                print("❌ Step 2 FAILED")
+                results["overall_validation_passed"] = False
+                results["execution_time_seconds"] = time.time() - start_time
+                if num_partitions > 0:
+                    leg.unpersist()
+                    dlt.unpersist()
+                return results
+        else:
+            results["step2_content_validation"] = {"passed": True}
+        
+        print("✓ Step 2 PASSED")
+    
+    # ========== STEP 3: ASSETS/INCOME VALIDATION ==========
+    print("\nStep 3: Assets/INCOME Validation...")
+    
+    # Create or reuse join
+    if joined is None:
+        joined = leg.alias("legacy").join(dlt.alias("delta"), on=primary_key, how="inner")
+    
+    joined = joined.coalesce(200).persist(StorageLevel.MEMORY_AND_DISK)
+    
+    # Get INCOME fields
     income_fields = []
     for f in legacy_df.schema.fields:
         if f.name == "INCOME" and isinstance(f.dataType, ArrayType):
             income_fields = [sf.name for sf in f.dataType.elementType.fields]
             break
     
-    income_conds = []
+    # Build qualifying condition
+    quals = []
     if "ASSETS_AMOUNT" in income_fields:
-        income_conds.append("x.ASSETS_AMOUNT is not null")
+        quals.append("x.ASSETS_AMOUNT is not null")
     if "UNTAXED_INCOME_AMOUNT" in income_fields:
-        income_conds.append("x.UNTAXED_INCOME_AMOUNT is not null")
-    qualifying = " or ".join(income_conds) if income_conds else "false"
+        quals.append("x.UNTAXED_INCOME_AMOUNT is not null")
+    qual_expr = " or ".join(quals) if quals else "false"
     
-    if legacy_has_assets:
-        cat = joined_df.withColumn("leg_valid", ~(F.isnull(F.col("legacy.assets")) | (F.size(F.col("legacy.assets")) == 0))).withColumn("has_qual", F.expr(f"exists(`legacy`.`INCOME`, x -> {qualifying})"))
+    # Categorize
+    if has_assets:
+        cat = joined.withColumn(
+            "leg_valid",
+            ~(F.isnull(F.col("legacy.assets")) | (F.size(F.col("legacy.assets")) == 0))
+        ).withColumn(
+            "has_qual",
+            F.expr(f"exists(`legacy`.`INCOME`, x -> {qual_expr})")
+        )
     else:
-        cat = joined_df.withColumn("leg_valid", F.lit(False)).withColumn("has_qual", F.expr(f"exists(`legacy`.`INCOME`, x -> {qualifying})"))
+        cat = joined.withColumn("leg_valid", F.lit(False)) \
+                    .withColumn("has_qual", F.expr(f"exists(`legacy`.`INCOME`, x -> {qual_expr})"))
     
-    # Case 2
-    case2_passed = True
-    if legacy_has_assets:
-        c2 = cat.filter(F.col("leg_valid") == True)
-        if c2.first():
-            asset_fields = None
-            for f in legacy_df.schema.fields:
-                if f.name == "assets" and isinstance(f.dataType, ArrayType):
-                    asset_fields = sorted([sf.name for sf in f.dataType.elementType.fields])
-                    break
-            if asset_fields:
-                fs = ", ".join([f"x.`{f}` as `{f}`" for f in asset_fields])
-                c2_comp = c2.withColumn("match", (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({fs}))))") == F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({fs}))))")) | (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull()))
-                case2_passed = (c2_comp.filter(F.col("match") == False).first() is None)
+    # Case 2: legacy.assets valid
+    case2_pass = True
+    if has_assets and cat.filter(F.col("leg_valid")).first():
+        # Get asset fields
+        asset_fields = None
+        for f in legacy_df.schema.fields:
+            if f.name == "assets" and isinstance(f.dataType, ArrayType):
+                asset_fields = sorted([sf.name for sf in f.dataType.elementType.fields])
+                break
+        
+        if asset_fields:
+            fs = ", ".join([f"x.`{f}` as `{f}`" for f in asset_fields])
+            c2 = cat.filter(F.col("leg_valid")).withColumn(
+                "match",
+                (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({fs}))))") ==
+                 F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({fs}))))")) |
+                (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
+            )
+            case2_pass = c2.filter(~F.col("match")).first() is None
     
-    # Case 1a
-    c1a = cat.filter((F.col("leg_valid") == False) & (F.col("has_qual") == True))
-    case1a_passed = True
-    if c1a.first():
-        exp_fields = sorted(income_to_assets_mapping.values())
-        l2d = {v: k for k, v in income_to_assets_mapping.items()}
+    # Case 1a: legacy.assets invalid, has qualifying income
+    case1a_pass = True
+    c1a_filter = cat.filter((~F.col("leg_valid")) & F.col("has_qual"))
+    if c1a_filter.first():
+        exp_fields = sorted(income_to_assets.values())
+        l2d = {v: k for k, v in income_to_assets.items()}
         mapped = ", ".join([f"x.`{l2d[d]}` as `{d}`" for d in exp_fields])
-        delta_norm = ", ".join([f"x.`{f}` as `{f}`" for f in exp_fields])
-        c1a_val = c1a.withColumn("exp", F.expr(f"array_sort(transform(filter(`legacy`.`INCOME`, x -> {qualifying}), x -> to_json(struct({mapped}))))")).withColumn("del_norm", F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({delta_norm}))))")).withColumn("match", F.col("exp") == F.col("del_norm"))
-        case1a_passed = (c1a_val.filter(F.col("match") == False).first() is None)
+        dlt_norm = ", ".join([f"x.`{f}` as `{f}`" for f in exp_fields])
+        
+        c1a = c1a_filter.withColumn(
+            "exp",
+            F.expr(f"array_sort(transform(filter(`legacy`.`INCOME`, x -> {qual_expr}), x -> to_json(struct({mapped}))))")
+        ).withColumn(
+            "dlt_norm",
+            F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({dlt_norm}))))")
+        )
+        case1a_pass = c1a.filter(F.col("exp") != F.col("dlt_norm")).first() is None
     
-    # Case 1b
-    c1b = cat.filter((F.col("leg_valid") == False) & (F.col("has_qual") == False))
-    case1b_passed = True
-    if c1b.first():
-        c1b_comp = c1b.withColumn("null_empty", F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0))
-        case1b_passed = (c1b_comp.filter(F.col("null_empty") == False).first() is None)
+    # Case 1b: legacy.assets invalid, no qualifying income
+    case1b_pass = True
+    c1b_filter = cat.filter((~F.col("leg_valid")) & (~F.col("has_qual")))
+    if c1b_filter.first():
+        c1b = c1b_filter.withColumn(
+            "null_empty",
+            F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0)
+        )
+        case1b_pass = c1b.filter(~F.col("null_empty")).first() is None
     
-    step3_passed = (case1a_passed and case1b_passed and case2_passed)
-    results["step3_assets_income_validation"] = {"passed": step3_passed, "case1a_passed": case1a_passed, "case1b_passed": case1b_passed, "case2_passed": case2_passed}
+    step3_pass = case1a_pass and case1b_pass and case2_pass
     
-    if not step3_passed:
+    results["step3_assets_income_validation"] = {
+        "passed": step3_pass,
+        "case1a_passed": case1a_pass,
+        "case1b_passed": case1b_pass,
+        "case2_passed": case2_pass
+    }
+    
+    if not step3_pass:
+        print("❌ Step 3 FAILED")
+        print(f"  Case 1a: {'PASS' if case1a_pass else 'FAIL'}")
+        print(f"  Case 1b: {'PASS' if case1b_pass else 'FAIL'}")
+        print(f"  Case 2: {'PASS' if case2_pass else 'FAIL'}")
         results["overall_validation_passed"] = False
-        print("Step 3 FAILED")
     else:
-        print("Step 3 PASSED")
+        print("✓ Step 3 PASSED")
     
-    joined_df.unpersist()
-    legacy_df.unpersist()
-    delta_df.unpersist()
-    results["execution_time_seconds"] = time.time() - start_time
-    print(f"Validation {'PASSED' if results['overall_validation_passed'] else 'FAILED'} ({results['execution_time_seconds']:.2f}s)")
-    return results
-
-
-def compare_legacy_vs_delta_chunked(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, num_chunks: int = 4, materialize_inputs: bool = True) -> Dict:
-    """Validate in chunks - more reliable for large DataFrames."""
-    start_time = time.time()
-    print(f"\n{'='*60}\nCHUNKED: {num_chunks} chunks\n{'='*60}")
-    
-    total = legacy_df.count()
-    print(f"Total: {total:,}\n")
-    
-    results = {"total_rows": total, "num_chunks": num_chunks, "chunks_validated": 0, "chunk_results": [], "overall_validation_passed": True, "execution_time_seconds": 0}
-    
-    for i in range(num_chunks):
-        print(f"\n{'='*60}\nCHUNK {i+1}/{num_chunks}\n{'='*60}")
-        
-        chunk_leg = legacy_df.filter(F.expr(f"abs(hash({primary_key})) % {num_chunks} = {i}"))
-        chunk_cnt = chunk_leg.count()
-        print(f"Size: {chunk_cnt:,}")
-        
-        chunk_del = delta_df.join(chunk_leg.select(primary_key), on=primary_key, how="inner")
-        chunk_res = compare_legacy_vs_delta(chunk_leg, chunk_del, primary_key, materialize_inputs)
-        
-        results["chunk_results"].append({"chunk_num": i+1, "chunk_size": chunk_cnt, "passed": chunk_res["overall_validation_passed"], "execution_time": chunk_res["execution_time_seconds"]})
-        results["chunks_validated"] += 1
-        
-        if not chunk_res["overall_validation_passed"]:
-            print(f"\n❌ CHUNK {i+1} FAILED")
-            results["overall_validation_passed"] = False
-            results["execution_time_seconds"] = time.time() - start_time
-            return results
-        print(f"✓ Chunk {i+1} PASSED")
+    # Cleanup
+    joined.unpersist()
+    if num_partitions > 0:
+        leg.unpersist()
+        dlt.unpersist()
     
     results["execution_time_seconds"] = time.time() - start_time
-    print(f"\n{'='*60}\n✓ ALL PASSED ({results['execution_time_seconds']:.2f}s)\n{'='*60}")
+    
+    print(f"\n{'='*70}")
+    print(f"{'PASSED' if results['overall_validation_passed'] else 'FAILED'} ({results['execution_time_seconds']:.1f}s)")
+    print(f"{'='*70}\n")
+    
     return results
-
-
-def compare_legacy_vs_delta_subset(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, sample_size: int = 1000, materialize_inputs: bool = True) -> Dict:
-    """
-    Validate on a small subset - useful for testing transformation logic on complex DataFrames.
-    
-    Use this to verify your transformation script is correct before attempting full validation.
-    
-    Args:
-        legacy_df: Source of truth DataFrame
-        delta_df: Target DataFrame (can be transformed parquet)
-        primary_key: Primary key column name
-        sample_size: Number of rows to validate (default: 1000)
-        materialize_inputs: Cache inputs (default: True)
-    
-    Returns:
-        Dict with validation results on subset
-    """
-    start_time = time.time()
-    print(f"\n{'='*60}")
-    print(f"SUBSET VALIDATION: {sample_size} rows")
-    print(f"Testing transformation logic on small sample...")
-    print(f"{'='*60}\n")
-    
-    # Take a small sample from legacy
-    print(f"Sampling {sample_size} rows from legacy...")
-    legacy_subset = legacy_df.limit(sample_size)
-    
-    # Get the PKs from the sample
-    print("Extracting matching rows from delta...")
-    subset_pks = legacy_subset.select(primary_key)
-    delta_subset = delta_df.join(subset_pks, on=primary_key, how="inner")
-    
-    # Validate the subset
-    print(f"\nValidating {sample_size} row subset...\n")
-    result = compare_legacy_vs_delta(legacy_subset, delta_subset, primary_key, materialize_inputs)
-    
-    result["subset_validation"] = True
-    result["sample_size"] = sample_size
-    
-    print(f"\n{'='*60}")
-    if result["overall_validation_passed"]:
-        print(f"✓ SUBSET VALIDATION PASSED")
-        print(f"Transformation logic appears correct on {sample_size} rows.")
-        print(f"Consider running full chunked validation next.")
-    else:
-        print(f"❌ SUBSET VALIDATION FAILED")
-        print(f"Fix transformation logic before attempting full validation.")
-    print(f"Time: {result['execution_time_seconds']:.2f}s")
-    print(f"{'='*60}\n")
-    
-    return result
