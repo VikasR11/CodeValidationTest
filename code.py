@@ -5,9 +5,20 @@ from typing import Dict, List
 import time
 
 
-def validate_dataframes(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str) -> Dict:
+def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str) -> Dict:
     """
     Validate that delta DataFrame matches legacy DataFrame (source of truth) for 230M rows.
+    
+    Validation Steps:
+    1. PK Validation: Ensure same set of primary keys in both DataFrames
+    2. Content Validation: Compare shared columns (excluding assets and INCOME)
+    3. Assets/INCOME Validation:
+       - Case 1: legacy.assets is null/empty/missing
+         - Case 1a: If qualifying INCOME structs exist (non-null ASSETS_AMOUNT/UNTAXED_INCOME_AMOUNT),
+                    delta.assets should contain mapped values
+         - Case 1b: If no qualifying INCOME structs OR if ASSETS_AMOUNT/UNTAXED_INCOME_AMOUNT fields
+                    don't exist in schema, delta.assets should be null
+       - Case 2: legacy.assets is valid → delta.assets should match exactly (order-insensitive)
     
     Args:
         legacy_df: Source of truth DataFrame in Parquet format
@@ -24,11 +35,15 @@ def validate_dataframes(legacy_df: DataFrame, delta_df: DataFrame, primary_key: 
     excluded_columns = ['assets', 'INCOME']
     
     # Define income to assets field mapping for Case 1a
-    # TODO: Fill in complete mapping
+    # Maps legacy.INCOME fields to delta.assets fields
     income_to_assets_mapping = {
-        'INCOME_SOURCE': 'assets_source',
-        'INCOME_CHANNEL': 'assets_channel',
-        # Add more mappings here
+        'INCM_SOURCE': 'assets_source',
+        'INCOME_CHANNEL_NAME': 'assets_channel_name',
+        'STRATEGY_NAME': 'assets_strategy_name',
+        'INCOME_LAST_MODIFIED_SOURCE_SYSTEM': 'assets_last_modified_source_system',
+        'INCOME_REPORTED_TS': 'assets_reported_utc_timestamp',
+        'ASSETS_AMOUNT': 'assets_amount',
+        'UNTAXED_INCOME_AMOUNT': 'untaxed_income_amount',
     }
     
     # Cache DataFrames for multiple operations
@@ -117,7 +132,7 @@ def validate_dataframes(legacy_df: DataFrame, delta_df: DataFrame, primary_key: 
                 
                 # Create expression to transform delta.HOUSING, selecting only fields that exist in legacy
                 field_selections = ", ".join([f"x.{field} as {field}" for field in legacy_housing_fields])
-                delta_filtered = F.expr(f"transform(`delta.HOUSING`, x -> struct({field_selections}))")
+                delta_filtered = F.expr(f"transform(`delta`.`HOUSING`, x -> struct({field_selections}))")
                 
                 # Compare sorted JSON (order doesn't matter)
                 legacy_json = F.to_json(F.array_sort(F.col(f"legacy.{col_name}")))
@@ -207,6 +222,28 @@ def validate_dataframes(legacy_df: DataFrame, delta_df: DataFrame, primary_key: 
     # ========================================
     print("Starting Step 3: Assets and INCOME Validation...")
     
+    # Check which fields exist in legacy.INCOME schema
+    income_schema_fields = []
+    for field in legacy_df.schema.fields:
+        if field.name == "INCOME" and isinstance(field.dataType, ArrayType):
+            income_schema_fields = [f.name for f in field.dataType.elementType.fields]
+            break
+    
+    # Build the qualifying income condition based on which fields exist
+    income_conditions = []
+    if "ASSETS_AMOUNT" in income_schema_fields:
+        income_conditions.append("x.ASSETS_AMOUNT is not null")
+    if "UNTAXED_INCOME_AMOUNT" in income_schema_fields:
+        income_conditions.append("x.UNTAXED_INCOME_AMOUNT is not null")
+    
+    # If neither field exists, all Case 1 rows should be Case 1b (delta.assets should be null)
+    if not income_conditions:
+        print("Note: Neither ASSETS_AMOUNT nor UNTAXED_INCOME_AMOUNT exists in legacy.INCOME schema")
+        print("All Case 1 rows will be validated as Case 1b (delta.assets should be null)")
+        qualifying_income_condition = "false"  # No qualifying income possible
+    else:
+        qualifying_income_condition = " or ".join(income_conditions)
+    
     # Add columns to categorize each row into cases
     categorized_df = step3_df.withColumn(
         "legacy_assets_valid",
@@ -214,7 +251,8 @@ def validate_dataframes(legacy_df: DataFrame, delta_df: DataFrame, primary_key: 
     ).withColumn(
         "has_qualifying_income",
         # Check if any struct in legacy.INCOME has non-null ASSETS_AMOUNT or UNTAXED_INCOME_AMOUNT
-        F.expr("exists(`legacy.INCOME`, x -> x.ASSETS_AMOUNT is not null or x.UNTAXED_INCOME_AMOUNT is not null)")
+        # If fields don't exist, this will always be False
+        F.expr(f"exists(`legacy`.`INCOME`, x -> {qualifying_income_condition})")
     )
     
     # Case 2: legacy.assets is valid
@@ -260,7 +298,7 @@ def validate_dataframes(legacy_df: DataFrame, delta_df: DataFrame, primary_key: 
             "expected_assets",
             F.expr(f"""
                 transform(
-                    filter(`legacy.INCOME`, x -> x.ASSETS_AMOUNT is not null or x.UNTAXED_INCOME_AMOUNT is not null),
+                    filter(`legacy`.`INCOME`, x -> {qualifying_income_condition}),
                     x -> struct({mapped_fields})
                 )
             """)
@@ -324,7 +362,7 @@ if __name__ == "__main__":
     # delta_df = spark.read.format("delta").load("path/to/delta")
     
     # Run validation
-    # results = validate_dataframes(legacy_df, delta_df, "id")
+    # results = compare_legacy_vs_delta(legacy_df, delta_df, "id")
     # print(results)
     
     # If validation fails, check the sample mismatch
