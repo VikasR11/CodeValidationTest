@@ -69,14 +69,16 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     legacy_keys = legacy_df.select(primary_key).withColumn("src", F.lit(1))
     delta_keys = delta_df.select(primary_key).withColumn("src", F.lit(2))
     
-    pks_match = (
+    mismatched_pks = (
         legacy_keys.unionByName(delta_keys)
         .groupBy(primary_key)
         .agg(F.countDistinct("src").alias("c"))
         .filter(F.col("c") != 2)
         .limit(1)
-        .count() == 0
+        .take(1)  # Returns empty list if no mismatches
     )
+    
+    pks_match = len(mismatched_pks) == 0
     
     if not pks_match:
         print("Step 1 FAILED: PKs do not match")
