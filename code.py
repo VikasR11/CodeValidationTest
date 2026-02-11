@@ -41,10 +41,15 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         print("Materializing input DataFrames to avoid lineage issues...")
         legacy_df.persist(StorageLevel.MEMORY_AND_DISK)
         delta_df.persist(StorageLevel.MEMORY_AND_DISK)
-        # Force evaluation - executes transformation chain once and stores in memory
-        legacy_count = legacy_df.count()
-        delta_count = delta_df.count()
-        print(f"Materialized: legacy ({legacy_count:,} rows), delta ({delta_count:,} rows)")
+        
+        # Try to force evaluation with count() - if it fails, caching will happen on first use
+        try:
+            legacy_count = legacy_df.count()
+            delta_count = delta_df.count()
+            print(f"Materialized: legacy ({legacy_count:,} rows), delta ({delta_count:,} rows)")
+        except Exception as e:
+            print(f"Note: Could not count rows (will materialize on first operation): {str(e)[:100]}")
+            print("Continuing with lazy materialization...")
     else:
         # Still cache for efficiency even if not forcing materialization
         legacy_df.persist(StorageLevel.MEMORY_AND_DISK)
