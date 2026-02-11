@@ -5,7 +5,7 @@ from typing import Dict, List
 import time
 
 
-def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, skip_pk_validation: bool = False, repartition: bool = False) -> Dict:
+def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, repartition: bool = False, materialize_inputs: bool = True) -> Dict:
     """
     Validate that delta DataFrame matches legacy DataFrame (source of truth) for 230M rows.
     
@@ -22,14 +22,31 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     
     Args:
         legacy_df: Source of truth DataFrame in Parquet format
-        delta_df: Modern DataFrame in Delta Lake format
+        delta_df: Modern DataFrame in Delta Lake format (or transformed parquet)
         primary_key: Single column name to use as primary key
+        repartition: Repartition DataFrames for better join performance (default: False)
+        materialize_inputs: Cache and materialize inputs to avoid lineage issues (default: True)
     
     Returns:
         Dictionary with validation results for all steps
     """
     
     start_time = time.time()
+    
+    # Materialize inputs to avoid lineage explosion issues
+    # This is critical when delta_df is a transformed parquet with long lineage
+    if materialize_inputs:
+        print("Materializing input DataFrames to avoid lineage issues...")
+        legacy_df.cache()
+        delta_df.cache()
+        # Force evaluation - executes transformation chain once and stores in memory
+        legacy_count = legacy_df.count()
+        delta_count = delta_df.count()
+        print(f"Materialized: legacy ({legacy_count:,} rows), delta ({delta_count:,} rows)")
+    else:
+        # Still cache for efficiency even if not forcing materialization
+        legacy_df.cache()
+        delta_df.cache()
     
     # Define excluded columns for step 2 (handled in step 3)
     excluded_columns = ['assets', 'INCOME']
@@ -45,10 +62,6 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         'ASSETS_AMOUNT': 'assets_amount',
         'UNTAXED_INCOME_AMOUNT': 'untaxed_income_amount',
     }
-    
-    # Cache DataFrames for multiple operations
-    legacy_df.cache()
-    delta_df.cache()
     
     results = {
         "step1_pk_validation": {},
@@ -72,49 +85,45 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     # ========================================
     # STEP 1: Primary Key Validation (Optimized approach)
     # ========================================
-    if skip_pk_validation:
-        print("Skipping Step 1: PK Validation (skip_pk_validation=True)")
+    # STEP 1: Primary Key Validation (Optimized approach)
+    # ========================================
+    print("Starting Step 1: PK Validation...")
+    
+    # Fast PK validation using union + groupBy
+    # If PKs match, each PK will have src values {1, 2}
+    # If PKs don't match, some PKs will have only src=1 or src=2
+    legacy_keys = legacy_repartitioned.select(primary_key).withColumn("src", F.lit(1))
+    delta_keys = delta_repartitioned.select(primary_key).withColumn("src", F.lit(2))
+    
+    print("Checking for PK mismatches...")
+    mismatched_pks = (
+        legacy_keys.unionByName(delta_keys)
+        .groupBy(primary_key)
+        .agg(F.countDistinct("src").alias("c"))
+        .filter(F.col("c") != 2)
+        .limit(1)
+        .take(1)  # Returns empty list if no mismatches
+    )
+    
+    pks_match = len(mismatched_pks) == 0
+    
+    if not pks_match:
+        print("Step 1 FAILED: PKs do not match")
         results["step1_pk_validation"] = {
-            "passed": True,
-            "skipped": True
+            "passed": False
         }
-    else:
-        print("Starting Step 1: PK Validation...")
-        
-        # Fast PK validation using union + groupBy
-        # If PKs match, each PK will have src values {1, 2}
-        # If PKs don't match, some PKs will have only src=1 or src=2
-        legacy_keys = legacy_repartitioned.select(primary_key).withColumn("src", F.lit(1))
-        delta_keys = delta_repartitioned.select(primary_key).withColumn("src", F.lit(2))
-        
-        print("Checking for PK mismatches...")
-        mismatched_pks = (
-            legacy_keys.unionByName(delta_keys)
-            .groupBy(primary_key)
-            .agg(F.countDistinct("src").alias("c"))
-            .filter(F.col("c") != 2)
-            .limit(1)
-            .take(1)  # Returns empty list if no mismatches
-        )
-        
-        pks_match = len(mismatched_pks) == 0
-        
-        if not pks_match:
-            print("Step 1 FAILED: PKs do not match")
-            results["step1_pk_validation"] = {
-                "passed": False
-            }
-            results["overall_validation_passed"] = False
-            results["execution_time_seconds"] = time.time() - start_time
-            legacy_df.unpersist()
-            delta_df.unpersist()
-            return results
-        
-        results["step1_pk_validation"] = {
-            "passed": True
-        }
-        
-        print(f"Step 1 PASSED: PKs match")
+        results["overall_validation_passed"] = False
+        results["execution_time_seconds"] = time.time() - start_time
+        legacy_df.unpersist()
+        delta_df.unpersist()
+        return results
+    
+    results["step1_pk_validation"] = {
+        "passed": True
+    }
+    
+    print(f"Step 1 PASSED: PKs match")
+
     
     # ========================================
     # STEP 2: Content Validation
