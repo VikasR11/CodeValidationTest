@@ -1,11 +1,12 @@
 from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
 from pyspark.sql.types import ArrayType, StructType
+from pyspark import StorageLevel
 from typing import Dict, List
 import time
 
 
-def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, repartition: bool = False, materialize_inputs: bool = True) -> Dict:
+def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, num_partitions: int = 0, materialize_inputs: bool = True) -> Dict:
     """
     Validate that delta DataFrame matches legacy DataFrame (source of truth) for 230M rows.
     
@@ -24,7 +25,8 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         legacy_df: Source of truth DataFrame in Parquet format
         delta_df: Modern DataFrame in Delta Lake format (or transformed parquet)
         primary_key: Single column name to use as primary key
-        repartition: Repartition DataFrames for better join performance (default: False)
+        num_partitions: Number of partitions to repartition to (default: 0 = no repartitioning). 
+                       Try 300-400 for 200-core cluster with complex nested data.
         materialize_inputs: Cache and materialize inputs to avoid lineage issues (default: True)
     
     Returns:
@@ -37,16 +39,16 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     # This is critical when delta_df is a transformed parquet with long lineage
     if materialize_inputs:
         print("Materializing input DataFrames to avoid lineage issues...")
-        legacy_df.cache()
-        delta_df.cache()
+        legacy_df.persist(StorageLevel.MEMORY_AND_DISK)
+        delta_df.persist(StorageLevel.MEMORY_AND_DISK)
         # Force evaluation - executes transformation chain once and stores in memory
         legacy_count = legacy_df.count()
         delta_count = delta_df.count()
         print(f"Materialized: legacy ({legacy_count:,} rows), delta ({delta_count:,} rows)")
     else:
         # Still cache for efficiency even if not forcing materialization
-        legacy_df.cache()
-        delta_df.cache()
+        legacy_df.persist(StorageLevel.MEMORY_AND_DISK)
+        delta_df.persist(StorageLevel.MEMORY_AND_DISK)
     
     # Define excluded columns for step 2 (handled in step 3)
     excluded_columns = ['assets', 'INCOME']
@@ -72,8 +74,7 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     }
     
     # Optionally repartition DataFrames for better join performance
-    if repartition:
-        num_partitions = 600  # Optimized for ~200 core cluster (3x cores)
+    if num_partitions > 0:
         print(f"Repartitioning DataFrames into {num_partitions} partitions...")
         legacy_repartitioned = legacy_df.repartition(num_partitions, primary_key)
         delta_repartitioned = delta_df.repartition(num_partitions, primary_key)
@@ -135,7 +136,7 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     delta_cols = set(delta_df.columns)
     shared_cols = (legacy_cols & delta_cols) - {primary_key} - set(excluded_columns)
     
-    # Inner join since we know PKs match (or we're assuming they do if skipped)
+    # Inner join since we know PKs match
     print("Joining DataFrames for content validation...")
     joined_df = legacy_repartitioned.alias("legacy").join(
         delta_repartitioned.alias("delta"),
@@ -143,9 +144,14 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         how="inner"
     )
     
+    # Coalesce to reduce partition overhead after join
+    # Use 200 partitions to match core count for optimal parallelism
+    print("Coalescing joined DataFrame to 200 partitions...")
+    joined_df = joined_df.coalesce(200)
+    
     # Persist for Step 2 and Step 3
     print("Persisting joined DataFrame...")
-    joined_df.persist()
+    joined_df.persist(StorageLevel.MEMORY_AND_DISK)
     
     # Use the joined_df directly for content validation
     content_df = joined_df
