@@ -158,13 +158,23 @@ def validate_dataframes(legacy_df: DataFrame, delta_df: DataFrame, primary_key: 
         # If there are mismatches, get one sample row
         sample_mismatch = None
         if mismatched_rows > 0:
-            sample_row = validation_df.filter(F.col("content_matches") == False).first()
+            # Get all column names from both sides
+            legacy_select_cols = [F.col(f"legacy.{c}").alias(f"legacy_{c}") for c in shared_cols]
+            delta_select_cols = [F.col(f"delta.{c}").alias(f"delta_{c}") for c in shared_cols]
+            
+            sample_df = validation_df.filter(F.col("content_matches") == False).select(
+                F.col(primary_key),
+                *legacy_select_cols,
+                *delta_select_cols
+            ).limit(1)
+            
+            sample_row = sample_df.first()
             if sample_row:
                 sample_dict = sample_row.asDict()
                 sample_mismatch = {
                     primary_key: sample_dict[primary_key],
-                    "legacy_row": {k.replace("legacy.", ""): v for k, v in sample_dict.items() if k.startswith("legacy.")},
-                    "delta_row": {k.replace("delta.", ""): v for k, v in sample_dict.items() if k.startswith("delta.")}
+                    "legacy_row": {k.replace("legacy_", ""): v for k, v in sample_dict.items() if k.startswith("legacy_")},
+                    "delta_row": {k.replace("delta_", ""): v for k, v in sample_dict.items() if k.startswith("delta_")}
                 }
     else:
         matching_rows = matching_count
