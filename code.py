@@ -68,9 +68,16 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     delta_cols = set(delta_df.columns)
     shared_cols = (legacy_cols & delta_cols) - {primary_key} - set(excluded_columns)
     
+    # Repartition both DataFrames on primary key for better join performance
+    # This helps avoid skew and makes the join more stable
+    num_partitions = 600  # Optimized for ~200 core cluster (2-4x cores is recommended)
+    print(f"Repartitioning DataFrames into {num_partitions} partitions...")
+    legacy_repartitioned = legacy_df.repartition(num_partitions, primary_key)
+    delta_repartitioned = delta_df.repartition(num_partitions, primary_key)
+    
     # Perform full outer join to check PKs and content in one operation
-    joined_df = legacy_df.alias("legacy").join(
-        delta_df.alias("delta"),
+    joined_df = legacy_repartitioned.alias("legacy").join(
+        delta_repartitioned.alias("delta"),
         on=primary_key,
         how="full_outer"
     )
@@ -84,16 +91,16 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         F.col(f"legacy.{primary_key}").isNull()
     )
     
-    # Count PK validation metrics (Step 1)
-    pk_stats = joined_df.agg(
-        F.sum(F.when(F.col("missing_in_delta"), 1).otherwise(0)).alias("missing_in_delta"),
-        F.sum(F.when(F.col("extra_in_delta"), 1).otherwise(0)).alias("extra_in_delta"),
-        F.count(F.when(~F.col("missing_in_delta") & ~F.col("extra_in_delta"), 1)).alias("matching_count")
-    ).collect()[0]
+    # Persist the joined DataFrame to avoid recomputation
+    print("Persisting joined DataFrame...")
+    joined_df.persist()
     
-    missing_in_delta = pk_stats["missing_in_delta"]
-    extra_in_delta = pk_stats["extra_in_delta"]
-    matching_count = pk_stats["matching_count"]
+    # Count PK validation metrics (Step 1)
+    # Use a simple count instead of collect to avoid memory issues
+    print("Computing PK validation metrics...")
+    missing_in_delta = joined_df.filter(F.col("missing_in_delta") == True).count()
+    extra_in_delta = joined_df.filter(F.col("extra_in_delta") == True).count()
+    matching_count = joined_df.filter((F.col("missing_in_delta") == False) & (F.col("extra_in_delta") == False)).count()
     
     pk_validation_passed = (missing_in_delta == 0 and extra_in_delta == 0)
     
@@ -109,6 +116,7 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         results["overall_validation_passed"] = False
         print(f"Step 1 FAILED: {missing_in_delta} missing in delta, {extra_in_delta} extra in delta")
         results["execution_time_seconds"] = time.time() - start_time
+        joined_df.unpersist()
         legacy_df.unpersist()
         delta_df.unpersist()
         return results
@@ -245,7 +253,20 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         results["overall_validation_passed"] = False
         print(f"Step 2 FAILED: {mismatched_rows} rows have content mismatches")
         if sample_mismatch:
-            print(f"Sample mismatched row PK: {sample_mismatch[primary_key]}")
+            print(f"\nSample mismatched row PK: {sample_mismatch[primary_key]}")
+            print(f"\nLegacy row:")
+            for col, val in sample_mismatch['legacy_row'].items():
+                print(f"  {col}: {val}")
+            print(f"\nDelta row:")
+            for col, val in sample_mismatch['delta_row'].items():
+                print(f"  {col}: {val}")
+        
+        # Clean up and return early
+        results["execution_time_seconds"] = time.time() - start_time
+        joined_df.unpersist()
+        legacy_df.unpersist()
+        delta_df.unpersist()
+        return results
     else:
         print(f"Step 2 PASSED: All {matching_rows} rows match")
     
@@ -411,6 +432,7 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         print(f"Step 3 PASSED: All assets and INCOME validations successful")
     
     # Unpersist cached DataFrames
+    joined_df.unpersist()
     legacy_df.unpersist()
     delta_df.unpersist()
     
@@ -422,22 +444,3 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     print(f"{'='*50}")
     
     return results
-
-
-# Example usage:
-if __name__ == "__main__":
-    # This is just a template - you would load your actual DataFrames
-    # legacy_df = spark.read.parquet("path/to/legacy")
-    # delta_df = spark.read.format("delta").load("path/to/delta")
-    
-    # Run validation
-    # results = compare_legacy_vs_delta(legacy_df, delta_df, "id")
-    # print(results)
-    
-    # If validation fails, check the sample mismatch
-    # if not results["step2_content_validation"]["content_validation_passed"]:
-    #     sample = results["step2_content_validation"]["sample_mismatch"]
-    #     print(f"\nSample mismatch for PK: {sample['id']}")
-    #     print(f"\nLegacy row: {sample['legacy_row']}")
-    #     print(f"\nDelta row: {sample['delta_row']}")
-    pass
