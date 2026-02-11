@@ -5,7 +5,7 @@ from typing import Dict, List
 import time
 
 
-def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str) -> Dict:
+def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, skip_pk_validation: bool = False) -> Dict:
     """
     Validate that delta DataFrame matches legacy DataFrame (source of truth) for 230M rows.
     
@@ -61,56 +61,67 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     # ========================================
     # STEP 1: Primary Key Validation (Optimized approach)
     # ========================================
-    print("Starting Step 1: PK Validation...")
-    
-    # Fast PK validation using union + groupBy
-    # If PKs match, each PK will have src values {1, 2}
-    # If PKs don't match, some PKs will have only src=1 or src=2
-    legacy_keys = legacy_df.select(primary_key).withColumn("src", F.lit(1))
-    delta_keys = delta_df.select(primary_key).withColumn("src", F.lit(2))
-    
-    mismatched_pks = (
-        legacy_keys.unionByName(delta_keys)
-        .groupBy(primary_key)
-        .agg(F.countDistinct("src").alias("c"))
-        .filter(F.col("c") != 2)
-        .limit(1)
-        .take(1)  # Returns empty list if no mismatches
-    )
-    
-    pks_match = len(mismatched_pks) == 0
-    
-    if not pks_match:
-        print("Step 1 FAILED: PKs do not match")
-        # Get counts for reporting
+    if skip_pk_validation:
+        print("Skipping Step 1: PK Validation (skip_pk_validation=True)")
+        results["step1_pk_validation"] = {
+            "skipped": True,
+            "message": "PK validation skipped"
+        }
+    else:
+        print("Starting Step 1: PK Validation...")
+        
+        # Fast PK validation using union + groupBy
+        # If PKs match, each PK will have src values {1, 2}
+        # If PKs don't match, some PKs will have only src=1 or src=2
+        num_partitions = 600  # Optimized for ~200 core cluster
+        
+        legacy_keys = legacy_df.select(primary_key).withColumn("src", F.lit(1)).repartition(num_partitions, primary_key)
+        delta_keys = delta_df.select(primary_key).withColumn("src", F.lit(2)).repartition(num_partitions, primary_key)
+        
+        print("Checking for PK mismatches...")
+        mismatched_pks = (
+            legacy_keys.unionByName(delta_keys)
+            .groupBy(primary_key)
+            .agg(F.countDistinct("src").alias("c"))
+            .filter(F.col("c") != 2)
+            .limit(1)
+            .take(1)  # Returns empty list if no mismatches
+        )
+        
+        pks_match = len(mismatched_pks) == 0
+        
+        if not pks_match:
+            print("Step 1 FAILED: PKs do not match")
+            # Get counts for reporting
+            legacy_count = legacy_df.select(primary_key).distinct().count()
+            delta_count = delta_df.select(primary_key).distinct().count()
+            
+            results["step1_pk_validation"] = {
+                "legacy_count": legacy_count,
+                "delta_count": delta_count,
+                "missing_in_delta": "unknown - validation failed",
+                "extra_in_delta": "unknown - validation failed",
+                "pk_validation_passed": False
+            }
+            results["overall_validation_passed"] = False
+            results["execution_time_seconds"] = time.time() - start_time
+            legacy_df.unpersist()
+            delta_df.unpersist()
+            return results
+        
+        print("PKs match! Getting counts...")
+        # Get counts for reporting (only if validation passed)
         legacy_count = legacy_df.select(primary_key).distinct().count()
-        delta_count = delta_df.select(primary_key).distinct().count()
         
         results["step1_pk_validation"] = {
             "legacy_count": legacy_count,
-            "delta_count": delta_count,
-            "missing_in_delta": "unknown - validation failed",
-            "extra_in_delta": "unknown - validation failed",
-            "pk_validation_passed": False
+            "delta_count": legacy_count,  # Same since they match
+            "missing_in_delta": 0,
+            "extra_in_delta": 0,
+            "pk_validation_passed": True
         }
-        results["overall_validation_passed"] = False
-        results["execution_time_seconds"] = time.time() - start_time
-        legacy_df.unpersist()
-        delta_df.unpersist()
-        return results
-    
-    # Get counts for reporting (only if validation passed)
-    legacy_count = legacy_df.select(primary_key).distinct().count()
-    
-    results["step1_pk_validation"] = {
-        "legacy_count": legacy_count,
-        "delta_count": legacy_count,  # Same since they match
-        "missing_in_delta": 0,
-        "extra_in_delta": 0,
-        "pk_validation_passed": True
-    }
-    
-    print(f"Step 1 PASSED: Both DataFrames have {legacy_count} matching PKs")
+        
+        print(f"Step 1 PASSED: Both DataFrames have {legacy_count} matching PKs")
     
     # ========================================
     # STEP 2: Content Validation
@@ -124,7 +135,7 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     
     # Repartition both DataFrames on primary key for better join performance
     num_partitions = 600  # Optimized for ~200 core cluster
-    print(f"Repartitioning DataFrames into {num_partitions} partitions...")
+    print(f"Repartitioning DataFrames into {num_partitions} partitions for join...")
     legacy_repartitioned = legacy_df.repartition(num_partitions, primary_key)
     delta_repartitioned = delta_df.repartition(num_partitions, primary_key)
     
