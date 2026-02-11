@@ -272,6 +272,12 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     # ========================================
     print("Starting Step 3: Assets and INCOME Validation...")
     
+    # Check if assets column exists in legacy
+    legacy_has_assets = "assets" in legacy_df.columns
+    
+    if not legacy_has_assets:
+        print("Note: legacy.assets column does not exist - skipping Case 2, all rows will be Case 1")
+    
     # Check which fields exist in legacy.INCOME schema
     income_schema_fields = []
     for field in legacy_df.schema.fields:
@@ -295,59 +301,73 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         qualifying_income_condition = " or ".join(income_conditions)
     
     # Add columns to categorize each row into cases
-    categorized_df = step3_df.withColumn(
-        "legacy_assets_valid",
-        ~(F.isnull(F.col("legacy.assets")) | (F.size(F.col("legacy.assets")) == 0))
-    ).withColumn(
-        "has_qualifying_income",
-        # Check if any struct in legacy.INCOME has non-null ASSETS_AMOUNT or UNTAXED_INCOME_AMOUNT
-        # If fields don't exist, this will always be False
-        F.expr(f"exists(`legacy`.`INCOME`, x -> {qualifying_income_condition})")
-    )
+    if legacy_has_assets:
+        categorized_df = step3_df.withColumn(
+            "legacy_assets_valid",
+            ~(F.isnull(F.col("legacy.assets")) | (F.size(F.col("legacy.assets")) == 0))
+        ).withColumn(
+            "has_qualifying_income",
+            # Check if any struct in legacy.INCOME has non-null ASSETS_AMOUNT or UNTAXED_INCOME_AMOUNT
+            # If fields don't exist, this will always be False
+            F.expr(f"exists(`legacy`.`INCOME`, x -> {qualifying_income_condition})")
+        )
+    else:
+        # If legacy.assets doesn't exist, all rows are Case 1 (legacy_assets_valid = False)
+        categorized_df = step3_df.withColumn(
+            "legacy_assets_valid",
+            F.lit(False)
+        ).withColumn(
+            "has_qualifying_income",
+            # Check if any struct in legacy.INCOME has non-null ASSETS_AMOUNT or UNTAXED_INCOME_AMOUNT
+            F.expr(f"exists(`legacy`.`INCOME`, x -> {qualifying_income_condition})")
+        )
     
-    # Case 2: legacy.assets is valid
-    case2_df = categorized_df.filter(F.col("legacy_assets_valid") == True)
-    # Try to get first row - if None, no rows exist
-    case2_has_rows = (case2_df.first() is not None)
-    
-    # For Case 2, compare legacy.assets with delta.assets (completely order-insensitive)
+    # Case 2: legacy.assets is valid (only if legacy has assets column)
     case2_passed = True
     case2_sample = None
-    if case2_has_rows:
-        # Get struct fields from legacy.assets and sort them alphabetically
-        assets_schema_fields = None
-        for field in legacy_df.schema.fields:
-            if field.name == "assets" and isinstance(field.dataType, ArrayType):
-                assets_schema_fields = sorted([f.name for f in field.dataType.elementType.fields])
-                break
+    case2_has_rows = False
+    
+    if legacy_has_assets:
+        case2_df = categorized_df.filter(F.col("legacy_assets_valid") == True)
+        # Try to get first row - if None, no rows exist
+        case2_has_rows = (case2_df.first() is not None)
         
-        if assets_schema_fields:
-            # Normalize field order within each struct before comparison
-            field_selections = ", ".join([f"x.`{field}` as `{field}`" for field in assets_schema_fields])
+        # For Case 2, compare legacy.assets with delta.assets (completely order-insensitive)
+        if case2_has_rows:
+            # Get struct fields from legacy.assets and sort them alphabetically
+            assets_schema_fields = None
+            for field in legacy_df.schema.fields:
+                if field.name == "assets" and isinstance(field.dataType, ArrayType):
+                    assets_schema_fields = sorted([f.name for f in field.dataType.elementType.fields])
+                    break
             
-            case2_comparison = case2_df.withColumn(
-                "assets_match",
-                (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({field_selections}))))") == 
-                 F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({field_selections}))))")) |
-                (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
-            )
-        else:
-            # Fallback if we can't get schema
-            case2_comparison = case2_df.withColumn(
-                "assets_match",
-                (F.expr("array_sort(transform(`legacy`.`assets`, x -> to_json(x)))") == 
-                 F.expr("array_sort(transform(`delta`.`assets`, x -> to_json(x)))")) |
-                (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
-            )
-        
-        # Check if any failures exist by trying to get first failure
-        case2_failed_df = case2_comparison.filter(F.col("assets_match") == False)
-        first_failure = case2_failed_df.first()
-        case2_passed = (first_failure is None)
-        
-        # If failed, use the first_failure we already have
-        if not case2_passed:
-            case2_sample = first_failure.asDict() if first_failure else None
+            if assets_schema_fields:
+                # Normalize field order within each struct before comparison
+                field_selections = ", ".join([f"x.`{field}` as `{field}`" for field in assets_schema_fields])
+                
+                case2_comparison = case2_df.withColumn(
+                    "assets_match",
+                    (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({field_selections}))))") == 
+                     F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({field_selections}))))")) |
+                    (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
+                )
+            else:
+                # Fallback if we can't get schema
+                case2_comparison = case2_df.withColumn(
+                    "assets_match",
+                    (F.expr("array_sort(transform(`legacy`.`assets`, x -> to_json(x)))") == 
+                     F.expr("array_sort(transform(`delta`.`assets`, x -> to_json(x)))")) |
+                    (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
+                )
+            
+            # Check if any failures exist by trying to get first failure
+            case2_failed_df = case2_comparison.filter(F.col("assets_match") == False)
+            first_failure = case2_failed_df.first()
+            case2_passed = (first_failure is None)
+            
+            # If failed, use the first_failure we already have
+            if not case2_passed:
+                case2_sample = first_failure.asDict() if first_failure else None
     
     # Case 1: legacy.assets is null/empty
     case1_df = categorized_df.filter(F.col("legacy_assets_valid") == False)
