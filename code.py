@@ -83,7 +83,7 @@ def compare_legacy_vs_delta(
     results["step1_pk_validation"] = {"passed": pk_fail is None}
     
     if pk_fail:
-        print("❌ Step 1 FAILED")
+        print("Step 1 FAILED")
         results["overall_validation_passed"] = False
         results["execution_time_seconds"] = time.time() - start_time
         if num_partitions > 0:
@@ -91,7 +91,7 @@ def compare_legacy_vs_delta(
             dlt.unpersist()
         return results
     
-    print("✓ Step 1 PASSED")
+    print("Step 1 PASSED")
     
     # ========== STEP 2: CONTENT VALIDATION ==========
     print("\nStep 2: Content Validation...")
@@ -122,7 +122,7 @@ def compare_legacy_vs_delta(
                 fs = ", ".join([f"x.`{f}` as `{f}`" for f in fields])
                 comp = (
                     F.expr(f"array_sort(transform(`legacy`.`{col}`, x -> to_json(struct({fs}))))") ==
-                    F.expr(f"array_sort(transform(`delta`.`{col}`, x -> to_json(struct({fs}))))"))
+                    F.expr(f"array_sort(transform(`delta`.`{col}`, x -> to_json(struct({fs}))))")
                 )
                 comparisons.append(comp | (F.col(f"legacy.{col}").isNull() & F.col(f"delta.{col}").isNull()))
                 
@@ -161,7 +161,7 @@ def compare_legacy_vs_delta(
             results["step2_content_validation"] = {"passed": mismatch is None}
             
             if mismatch:
-                print("❌ Step 2 FAILED")
+                print("Step 2 FAILED")
                 results["overall_validation_passed"] = False
                 results["execution_time_seconds"] = time.time() - start_time
                 if num_partitions > 0:
@@ -171,7 +171,7 @@ def compare_legacy_vs_delta(
         else:
             results["step2_content_validation"] = {"passed": True}
         
-        print("✓ Step 2 PASSED")
+        print("Step 2 PASSED")
     
     # ========== STEP 3: ASSETS/INCOME VALIDATION ==========
     print("\nStep 3: Assets/INCOME Validation...")
@@ -212,7 +212,9 @@ def compare_legacy_vs_delta(
     
     # Case 2: legacy.assets valid
     case2_pass = True
-    if has_assets and cat.filter(F.col("leg_valid")).first():
+    if has_assets:
+        c2_filter = cat.filter(F.col("leg_valid"))
+        
         # Get asset fields
         asset_fields = None
         for f in legacy_df.schema.fields:
@@ -222,41 +224,47 @@ def compare_legacy_vs_delta(
         
         if asset_fields:
             fs = ", ".join([f"x.`{f}` as `{f}`" for f in asset_fields])
-            c2 = cat.filter(F.col("leg_valid")).withColumn(
+            c2 = c2_filter.withColumn(
                 "match",
                 (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({fs}))))") ==
                  F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({fs}))))")) |
                 (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
             )
-            case2_pass = c2.filter(~F.col("match")).first() is None
+            # Check for failures - .first() on filtered failures (should be None if no rows or all pass)
+            case2_fail = c2.filter(~F.col("match")).first()
+            case2_pass = (case2_fail is None)
     
     # Case 1a: legacy.assets invalid, has qualifying income
     case1a_pass = True
     c1a_filter = cat.filter((~F.col("leg_valid")) & F.col("has_qual"))
-    if c1a_filter.first():
-        exp_fields = sorted(income_to_assets.values())
-        l2d = {v: k for k, v in income_to_assets.items()}
-        mapped = ", ".join([f"x.`{l2d[d]}` as `{d}`" for d in exp_fields])
-        dlt_norm = ", ".join([f"x.`{f}` as `{f}`" for f in exp_fields])
-        
-        c1a = c1a_filter.withColumn(
-            "exp",
-            F.expr(f"array_sort(transform(filter(`legacy`.`INCOME`, x -> {qual_expr}), x -> to_json(struct({mapped}))))")
-        ).withColumn(
-            "dlt_norm",
-            F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({dlt_norm}))))")
-        )
-        case1a_pass = c1a.filter(F.col("exp") != F.col("dlt_norm")).first() is None
+    
+    exp_fields = sorted(income_to_assets.values())
+    l2d = {v: k for k, v in income_to_assets.items()}
+    mapped = ", ".join([f"x.`{l2d[d]}` as `{d}`" for d in exp_fields])
+    dlt_norm = ", ".join([f"x.`{f}` as `{f}`" for f in exp_fields])
+    
+    c1a = c1a_filter.withColumn(
+        "exp",
+        F.expr(f"array_sort(transform(filter(`legacy`.`INCOME`, x -> {qual_expr}), x -> to_json(struct({mapped}))))")
+    ).withColumn(
+        "dlt_norm",
+        F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({dlt_norm}))))")
+    )
+    # Check for failures
+    case1a_fail = c1a.filter(F.col("exp") != F.col("dlt_norm")).first()
+    case1a_pass = (case1a_fail is None)
     
     # Case 1b: legacy.assets invalid, no qualifying income
     case1b_pass = True
     c1b_filter = cat.filter((~F.col("leg_valid")) & (~F.col("has_qual")))
-    if c1b_filter.first():
-        c1b = c1b_filter.withColumn(
-            "null_empty",
-            F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0)
-        )
-        case1b_pass = c1b.filter(~F.col("null_empty")).first() is None
+    
+    c1b = c1b_filter.withColumn(
+        "null_empty",
+        F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0)
+    )
+    # Check for failures
+    case1b_fail = c1b.filter(~F.col("null_empty")).first()
+    case1b_pass = (case1b_fail is None)
     
     step3_pass = case1a_pass and case1b_pass and case2_pass
     
@@ -268,13 +276,13 @@ def compare_legacy_vs_delta(
     }
     
     if not step3_pass:
-        print("❌ Step 3 FAILED")
+        print("Step 3 FAILED")
         print(f"  Case 1a: {'PASS' if case1a_pass else 'FAIL'}")
         print(f"  Case 1b: {'PASS' if case1b_pass else 'FAIL'}")
         print(f"  Case 2: {'PASS' if case2_pass else 'FAIL'}")
         results["overall_validation_passed"] = False
     else:
-        print("✓ Step 3 PASSED")
+        print("Step 3 PASSED")
     
     # Cleanup
     joined.unpersist()
