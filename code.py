@@ -58,6 +58,12 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         "execution_time_seconds": 0
     }
     
+    # Repartition DataFrames once at the beginning for all operations
+    num_partitions = 600  # Optimized for ~200 core cluster
+    print(f"Repartitioning DataFrames into {num_partitions} partitions...")
+    legacy_repartitioned = legacy_df.repartition(num_partitions, primary_key)
+    delta_repartitioned = delta_df.repartition(num_partitions, primary_key)
+    
     # ========================================
     # STEP 1: Primary Key Validation (Optimized approach)
     # ========================================
@@ -73,10 +79,8 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         # Fast PK validation using union + groupBy
         # If PKs match, each PK will have src values {1, 2}
         # If PKs don't match, some PKs will have only src=1 or src=2
-        num_partitions = 600  # Optimized for ~200 core cluster
-        
-        legacy_keys = legacy_df.select(primary_key).withColumn("src", F.lit(1)).repartition(num_partitions, primary_key)
-        delta_keys = delta_df.select(primary_key).withColumn("src", F.lit(2)).repartition(num_partitions, primary_key)
+        legacy_keys = legacy_repartitioned.select(primary_key).withColumn("src", F.lit(1))
+        delta_keys = delta_repartitioned.select(primary_key).withColumn("src", F.lit(2))
         
         print("Checking for PK mismatches...")
         mismatched_pks = (
@@ -93,8 +97,8 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         if not pks_match:
             print("Step 1 FAILED: PKs do not match")
             # Get counts for reporting
-            legacy_count = legacy_df.select(primary_key).distinct().count()
-            delta_count = delta_df.select(primary_key).distinct().count()
+            legacy_count = legacy_repartitioned.select(primary_key).distinct().count()
+            delta_count = delta_repartitioned.select(primary_key).distinct().count()
             
             results["step1_pk_validation"] = {
                 "legacy_count": legacy_count,
@@ -111,7 +115,7 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         
         print("PKs match! Getting counts...")
         # Get counts for reporting (only if validation passed)
-        legacy_count = legacy_df.select(primary_key).distinct().count()
+        legacy_count = legacy_repartitioned.select(primary_key).distinct().count()
         
         results["step1_pk_validation"] = {
             "legacy_count": legacy_count,
@@ -133,13 +137,7 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     delta_cols = set(delta_df.columns)
     shared_cols = (legacy_cols & delta_cols) - {primary_key} - set(excluded_columns)
     
-    # Repartition both DataFrames on primary key for better join performance
-    num_partitions = 600  # Optimized for ~200 core cluster
-    print(f"Repartitioning DataFrames into {num_partitions} partitions for join...")
-    legacy_repartitioned = legacy_df.repartition(num_partitions, primary_key)
-    delta_repartitioned = delta_df.repartition(num_partitions, primary_key)
-    
-    # Inner join since we know PKs match
+    # Inner join since we know PKs match (or we're assuming they do if skipped)
     print("Joining DataFrames for content validation...")
     joined_df = legacy_repartitioned.alias("legacy").join(
         delta_repartitioned.alias("delta"),
@@ -236,10 +234,17 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         for condition in comparison_conditions[1:]:
             all_match = all_match & condition
         
-        # Count matching and mismatched rows
+        # Count matching and mismatched rows using single aggregation
         validation_df = content_df.withColumn("content_matches", all_match)
-        matching_rows = validation_df.filter(F.col("content_matches") == True).count()
-        mismatched_rows = validation_df.filter(F.col("content_matches") == False).count()
+        
+        # Use single aggregation instead of two separate counts
+        count_stats = validation_df.agg(
+            F.sum(F.when(F.col("content_matches") == True, 1).otherwise(0)).alias("matching"),
+            F.sum(F.when(F.col("content_matches") == False, 1).otherwise(0)).alias("mismatched")
+        ).take(1)[0]
+        
+        matching_rows = count_stats["matching"]
+        mismatched_rows = count_stats["mismatched"]
         
         # If there are mismatches, get one sample row
         sample_mismatch = None
