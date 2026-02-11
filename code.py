@@ -120,33 +120,52 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     
     # Function to compare columns accounting for different types (Step 2)
     def create_comparison_expr(col_name: str, df: DataFrame) -> F.col:
-        """Create comparison expression based on column type"""
+        """Create comparison expression based on column type - completely order-insensitive"""
         col_type = [field.dataType for field in df.schema.fields if field.name == col_name][0]
         
         if isinstance(col_type, ArrayType):
-            # For arrays (including array of structs), convert to JSON, sort, and compare
-            # Special handling for HOUSING array to ignore HOUSING_TYPE field in delta
             if col_name == "HOUSING":
-                # Get field names from legacy HOUSING schema (excluding HOUSING_TYPE)
-                legacy_housing_fields = [f.name for f in col_type.elementType.fields]
+                # Get field names from legacy HOUSING schema and sort them
+                legacy_housing_fields = sorted([f.name for f in col_type.elementType.fields])
                 
-                # Create full expression for delta HOUSING: filter fields, convert to JSON, sort
-                field_selections = ", ".join([f"x.{field} as {field}" for field in legacy_housing_fields])
+                # Build struct with fields in alphabetical order for both legacy and delta
+                field_selections = ", ".join([f"x.`{field}` as `{field}`" for field in legacy_housing_fields])
                 
-                # Build complete expressions for both sides
-                legacy_expr = F.expr(f"array_sort(transform(`legacy`.`{col_name}`, x -> to_json(x)))")
-                delta_expr = F.expr(f"array_sort(transform(transform(`delta`.`{col_name}`, x -> struct({field_selections})), y -> to_json(y)))")
+                # For legacy: reorder fields alphabetically, convert to JSON, sort array
+                legacy_expr = F.expr(f"""
+                    array_sort(transform(`legacy`.`{col_name}`, 
+                        x -> to_json(struct({field_selections}))
+                    ))
+                """)
+                
+                # For delta: filter to only legacy fields, reorder alphabetically, convert to JSON, sort array
+                delta_expr = F.expr(f"""
+                    array_sort(transform(`delta`.`{col_name}`, 
+                        x -> to_json(struct({field_selections}))
+                    ))
+                """)
                 
                 return (legacy_expr == delta_expr) | \
                        (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
             
             elif isinstance(col_type.elementType, StructType):
-                # For arrays of structs, convert each struct to JSON string, sort array, then compare
-                # This handles order within array AND ensures struct field order doesn't matter
-                legacy_json_array = F.expr(f"array_sort(transform(`legacy`.`{col_name}`, x -> to_json(x)))")
-                delta_json_array = F.expr(f"array_sort(transform(`delta`.`{col_name}`, x -> to_json(x)))")
+                # For arrays of structs, normalize field order within each struct
+                struct_fields = sorted([f.name for f in col_type.elementType.fields])
+                field_selections = ", ".join([f"x.`{field}` as `{field}`" for field in struct_fields])
                 
-                return (legacy_json_array == delta_json_array) | \
+                # Reorder fields alphabetically, convert to JSON, sort array
+                legacy_expr = F.expr(f"""
+                    array_sort(transform(`legacy`.`{col_name}`, 
+                        x -> to_json(struct({field_selections}))
+                    ))
+                """)
+                delta_expr = F.expr(f"""
+                    array_sort(transform(`delta`.`{col_name}`, 
+                        x -> to_json(struct({field_selections}))
+                    ))
+                """)
+                
+                return (legacy_expr == delta_expr) | \
                        (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
             else:
                 # For arrays of primitives, use simple array_sort
@@ -154,14 +173,21 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
                        (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
         
         elif isinstance(col_type, StructType):
-            # For struct columns, convert to JSON and compare
-            legacy_json = F.to_json(F.col(f"legacy.{col_name}"))
-            delta_json = F.to_json(F.col(f"delta.{col_name}"))
-            return (legacy_json == delta_json) | (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
+            # For struct columns, normalize field order before converting to JSON
+            struct_fields = sorted([f.name for f in col_type.fields])
+            field_selections_legacy = ", ".join([f"`legacy`.`{col_name}`.`{field}` as `{field}`" for field in struct_fields])
+            field_selections_delta = ", ".join([f"`delta`.`{col_name}`.`{field}` as `{field}`" for field in struct_fields])
+            
+            legacy_json = F.expr(f"to_json(struct({field_selections_legacy}))")
+            delta_json = F.expr(f"to_json(struct({field_selections_delta}))")
+            
+            return (legacy_json == delta_json) | \
+                   (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
         
         else:
             # For primitive types, direct comparison
-            return (F.col(f"legacy.{col_name}") == F.col(f"delta.{col_name}")) | (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
+            return (F.col(f"legacy.{col_name}") == F.col(f"delta.{col_name}")) | \
+                   (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
     
     # Create comparison conditions for all shared columns
     comparison_conditions = []
@@ -268,15 +294,34 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     case2_df = categorized_df.filter(F.col("legacy_assets_valid") == True)
     case2_total = case2_df.count()
     
-    # For Case 2, compare legacy.assets with delta.assets (order doesn't matter)
-    # Convert each struct to JSON, sort array of JSON strings, then compare
+    # For Case 2, compare legacy.assets with delta.assets (completely order-insensitive)
     if case2_total > 0:
-        case2_comparison = case2_df.withColumn(
-            "assets_match",
-            (F.array_sort(F.expr("transform(`legacy`.`assets`, x -> to_json(x))")) == 
-             F.array_sort(F.expr("transform(`delta`.`assets`, x -> to_json(x))"))) |
-            (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
-        )
+        # Get struct fields from legacy.assets and sort them alphabetically
+        assets_schema_fields = None
+        for field in legacy_df.schema.fields:
+            if field.name == "assets" and isinstance(field.dataType, ArrayType):
+                assets_schema_fields = sorted([f.name for f in field.dataType.elementType.fields])
+                break
+        
+        if assets_schema_fields:
+            # Normalize field order within each struct before comparison
+            field_selections = ", ".join([f"x.`{field}` as `{field}`" for field in assets_schema_fields])
+            
+            case2_comparison = case2_df.withColumn(
+                "assets_match",
+                (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({field_selections}))))") == 
+                 F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({field_selections}))))")) |
+                (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
+            )
+        else:
+            # Fallback if we can't get schema
+            case2_comparison = case2_df.withColumn(
+                "assets_match",
+                (F.expr("array_sort(transform(`legacy`.`assets`, x -> to_json(x)))") == 
+                 F.expr("array_sort(transform(`delta`.`assets`, x -> to_json(x)))")) |
+                (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
+            )
+        
         case2_passed = case2_comparison.filter(F.col("assets_match") == True).count()
         case2_failed = case2_total - case2_passed
     else:
@@ -297,27 +342,39 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     # For Case 1a: validate that delta.assets contains mapped structs from qualifying legacy.INCOME
     # Filter qualifying INCOME structs and map to expected assets format
     if case1a_total > 0:
+        # Get the expected field names (delta.assets field names) in alphabetical order
+        expected_fields = sorted(income_to_assets_mapping.values())
+        
         # Build the struct field mapping expression for the transform
+        # Map from legacy.INCOME to delta.assets field names, but in alphabetical order
+        legacy_to_delta_field_map = {v: k for k, v in income_to_assets_mapping.items()}
         mapped_fields = ", ".join([
-            f"x.{legacy_field} as {delta_field}" 
-            for legacy_field, delta_field in income_to_assets_mapping.items()
+            f"x.`{legacy_to_delta_field_map[delta_field]}` as `{delta_field}`"
+            for delta_field in expected_fields
         ])
+        
+        # For delta.assets, also normalize field order
+        delta_fields_normalized = ", ".join([f"x.`{field}` as `{field}`" for field in expected_fields])
         
         # Create expected assets by filtering and transforming qualifying INCOME structs
         case1a_validation = case1a_df.withColumn(
-            "expected_assets",
+            "expected_assets_normalized",
             F.expr(f"""
-                transform(
+                array_sort(transform(
                     filter(`legacy`.`INCOME`, x -> {qualifying_income_condition}),
-                    x -> struct({mapped_fields})
-                )
+                    x -> to_json(struct({mapped_fields}))
+                ))
+            """)
+        ).withColumn(
+            "delta_assets_normalized",
+            F.expr(f"""
+                array_sort(transform(`delta`.`assets`, 
+                    x -> to_json(struct({delta_fields_normalized}))
+                ))
             """)
         ).withColumn(
             "assets_match",
-            # Compare sorted JSON arrays (order doesn't matter)
-            # Convert each struct to JSON, sort array of JSON strings
-            F.array_sort(F.expr("transform(expected_assets, x -> to_json(x))")) == 
-            F.array_sort(F.expr("transform(`delta`.`assets`, x -> to_json(x))"))
+            F.col("expected_assets_normalized") == F.col("delta_assets_normalized")
         )
         
         case1a_passed = case1a_validation.filter(F.col("assets_match") == True).count()
