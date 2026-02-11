@@ -59,9 +59,61 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     }
     
     # ========================================
-    # STEPS 1 & 2 COMBINED: Single Join Operation
+    # STEP 1: Primary Key Validation (Optimized approach)
     # ========================================
-    print("Starting Steps 1 & 2: PK Validation and Content Validation...")
+    print("Starting Step 1: PK Validation...")
+    
+    # Fast PK validation using union + groupBy
+    # If PKs match, each PK will have src values {1, 2}
+    # If PKs don't match, some PKs will have only src=1 or src=2
+    legacy_keys = legacy_df.select(primary_key).withColumn("src", F.lit(1))
+    delta_keys = delta_df.select(primary_key).withColumn("src", F.lit(2))
+    
+    pks_match = (
+        legacy_keys.unionByName(delta_keys)
+        .groupBy(primary_key)
+        .agg(F.countDistinct("src").alias("c"))
+        .filter(F.col("c") != 2)
+        .limit(1)
+        .count() == 0
+    )
+    
+    if not pks_match:
+        print("Step 1 FAILED: PKs do not match")
+        # Get counts for reporting
+        legacy_count = legacy_df.select(primary_key).distinct().count()
+        delta_count = delta_df.select(primary_key).distinct().count()
+        
+        results["step1_pk_validation"] = {
+            "legacy_count": legacy_count,
+            "delta_count": delta_count,
+            "missing_in_delta": "unknown - validation failed",
+            "extra_in_delta": "unknown - validation failed",
+            "pk_validation_passed": False
+        }
+        results["overall_validation_passed"] = False
+        results["execution_time_seconds"] = time.time() - start_time
+        legacy_df.unpersist()
+        delta_df.unpersist()
+        return results
+    
+    # Get counts for reporting (only if validation passed)
+    legacy_count = legacy_df.select(primary_key).distinct().count()
+    
+    results["step1_pk_validation"] = {
+        "legacy_count": legacy_count,
+        "delta_count": legacy_count,  # Same since they match
+        "missing_in_delta": 0,
+        "extra_in_delta": 0,
+        "pk_validation_passed": True
+    }
+    
+    print(f"Step 1 PASSED: Both DataFrames have {legacy_count} matching PKs")
+    
+    # ========================================
+    # STEP 2: Content Validation
+    # ========================================
+    print("Starting Step 2: Content Validation...")
     
     # Get shared columns (excluding primary key and excluded columns)
     legacy_cols = set(legacy_df.columns)
@@ -69,71 +121,25 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     shared_cols = (legacy_cols & delta_cols) - {primary_key} - set(excluded_columns)
     
     # Repartition both DataFrames on primary key for better join performance
-    # This helps avoid skew and makes the join more stable
-    num_partitions = 600  # Optimized for ~200 core cluster (2-4x cores is recommended)
+    num_partitions = 600  # Optimized for ~200 core cluster
     print(f"Repartitioning DataFrames into {num_partitions} partitions...")
     legacy_repartitioned = legacy_df.repartition(num_partitions, primary_key)
     delta_repartitioned = delta_df.repartition(num_partitions, primary_key)
     
-    # Perform full outer join to check PKs and content in one operation
+    # Inner join since we know PKs match
+    print("Joining DataFrames for content validation...")
     joined_df = legacy_repartitioned.alias("legacy").join(
         delta_repartitioned.alias("delta"),
         on=primary_key,
-        how="full_outer"
+        how="inner"
     )
     
-    # For PK validation, create a lightweight DataFrame with just the indicators
-    # This avoids scanning all the wide columns
-    pk_validation_df = joined_df.select(
-        F.col(primary_key),
-        F.col(f"delta.{primary_key}").isNull().alias("missing_in_delta"),
-        F.col(f"legacy.{primary_key}").isNull().alias("extra_in_delta")
-    ).persist()
-    
-    print("Computing PK validation metrics...")
-    # Use single aggregation with take(1) instead of collect() - more memory efficient
-    pk_stats = pk_validation_df.agg(
-        F.sum(F.when(F.col("missing_in_delta"), 1).otherwise(0)).alias("missing_in_delta"),
-        F.sum(F.when(F.col("extra_in_delta"), 1).otherwise(0)).alias("extra_in_delta"),
-        F.count(F.when(~F.col("missing_in_delta") & ~F.col("extra_in_delta"), 1)).alias("matching_count")
-    ).take(1)[0]
-    
-    missing_in_delta = pk_stats["missing_in_delta"]
-    extra_in_delta = pk_stats["extra_in_delta"]
-    matching_count = pk_stats["matching_count"]
-    
-    # Unpersist the lightweight PK validation DataFrame
-    pk_validation_df.unpersist()
-    
-    pk_validation_passed = (missing_in_delta == 0 and extra_in_delta == 0)
-    
-    results["step1_pk_validation"] = {
-        "legacy_count": matching_count if pk_validation_passed else matching_count + missing_in_delta,
-        "delta_count": matching_count if pk_validation_passed else matching_count + extra_in_delta,
-        "missing_in_delta": missing_in_delta,
-        "extra_in_delta": extra_in_delta,
-        "pk_validation_passed": pk_validation_passed
-    }
-    
-    if not pk_validation_passed:
-        results["overall_validation_passed"] = False
-        print(f"Step 1 FAILED: {missing_in_delta} missing in delta, {extra_in_delta} extra in delta")
-        results["execution_time_seconds"] = time.time() - start_time
-        legacy_df.unpersist()
-        delta_df.unpersist()
-        return results
-    
-    print(f"Step 1 PASSED: All {matching_count} PKs match")
-    
-    # Now persist the full joined_df for Step 2
-    print("Persisting full joined DataFrame for content validation...")
+    # Persist for Step 2 and Step 3
+    print("Persisting joined DataFrame...")
     joined_df.persist()
     
-    # Filter to only matching PKs for content validation (Step 2)
-    # Filter out rows where either side is null
-    content_df = joined_df.filter(
-        F.col(f"legacy.{primary_key}").isNotNull() & F.col(f"delta.{primary_key}").isNotNull()
-    )
+    # Use the joined_df directly for content validation
+    content_df = joined_df
     
     # Function to compare columns accounting for different types (Step 2)
     def create_comparison_expr(col_name: str, df: DataFrame) -> F.col:
@@ -244,14 +250,14 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
                     "delta_row": {k.replace("delta_", ""): v for k, v in sample_dict.items() if k.startswith("delta_")}
                 }
     else:
-        matching_rows = matching_count
+        matching_rows = content_df.count()
         mismatched_rows = 0
         sample_mismatch = None
     
     content_validation_passed = (mismatched_rows == 0)
     
     results["step2_content_validation"] = {
-        "rows_checked": matching_count,
+        "rows_checked": matching_rows + mismatched_rows,
         "matching_rows": matching_rows,
         "mismatched_rows": mismatched_rows,
         "content_validation_passed": content_validation_passed,
