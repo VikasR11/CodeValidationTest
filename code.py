@@ -70,8 +70,8 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     if skip_pk_validation:
         print("Skipping Step 1: PK Validation (skip_pk_validation=True)")
         results["step1_pk_validation"] = {
-            "skipped": True,
-            "message": "PK validation skipped"
+            "passed": True,
+            "skipped": True
         }
     else:
         print("Starting Step 1: PK Validation...")
@@ -96,16 +96,8 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         
         if not pks_match:
             print("Step 1 FAILED: PKs do not match")
-            # Get counts for reporting
-            legacy_count = legacy_repartitioned.select(primary_key).distinct().count()
-            delta_count = delta_repartitioned.select(primary_key).distinct().count()
-            
             results["step1_pk_validation"] = {
-                "legacy_count": legacy_count,
-                "delta_count": delta_count,
-                "missing_in_delta": "unknown - validation failed",
-                "extra_in_delta": "unknown - validation failed",
-                "pk_validation_passed": False
+                "passed": False
             }
             results["overall_validation_passed"] = False
             results["execution_time_seconds"] = time.time() - start_time
@@ -113,19 +105,11 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
             delta_df.unpersist()
             return results
         
-        print("PKs match! Getting counts...")
-        # Get counts for reporting (only if validation passed)
-        legacy_count = legacy_repartitioned.select(primary_key).distinct().count()
-        
         results["step1_pk_validation"] = {
-            "legacy_count": legacy_count,
-            "delta_count": legacy_count,  # Same since they match
-            "missing_in_delta": 0,
-            "extra_in_delta": 0,
-            "pk_validation_passed": True
+            "passed": True
         }
         
-        print(f"Step 1 PASSED: Both DataFrames have {legacy_count} matching PKs")
+        print(f"Step 1 PASSED: PKs match")
     
     # ========================================
     # STEP 2: Content Validation
@@ -234,65 +218,54 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         for condition in comparison_conditions[1:]:
             all_match = all_match & condition
         
-        # Count matching and mismatched rows using single aggregation
+        # Check if there are any mismatches (don't count them - just check existence)
         validation_df = content_df.withColumn("content_matches", all_match)
         
-        # Use single aggregation instead of two separate counts
-        count_stats = validation_df.agg(
-            F.sum(F.when(F.col("content_matches") == True, 1).otherwise(0)).alias("matching"),
-            F.sum(F.when(F.col("content_matches") == False, 1).otherwise(0)).alias("mismatched")
-        ).take(1)[0]
+        # Cache this since we'll use it for both check and sample
+        validation_df.cache()
         
-        matching_rows = count_stats["matching"]
-        mismatched_rows = count_stats["mismatched"]
+        # Check if any mismatches exist (fast - stops at first mismatch)
+        mismatched_df = validation_df.filter(F.col("content_matches") == False)
+        has_mismatches = not mismatched_df.isEmpty()
         
-        # If there are mismatches, get one sample row
-        sample_mismatch = None
-        if mismatched_rows > 0:
-            # Get all column names from both sides
-            legacy_select_cols = [F.col(f"legacy.{c}").alias(f"legacy_{c}") for c in shared_cols]
-            delta_select_cols = [F.col(f"delta.{c}").alias(f"delta_{c}") for c in shared_cols]
-            
-            sample_df = validation_df.filter(F.col("content_matches") == False).select(
-                F.col(primary_key),
-                *legacy_select_cols,
-                *delta_select_cols
-            ).limit(1)
-            
-            sample_row = sample_df.first()
-            if sample_row:
-                sample_dict = sample_row.asDict()
-                sample_mismatch = {
-                    primary_key: sample_dict[primary_key],
-                    "legacy_row": {k.replace("legacy_", ""): v for k, v in sample_dict.items() if k.startswith("legacy_")},
-                    "delta_row": {k.replace("delta_", ""): v for k, v in sample_dict.items() if k.startswith("delta_")}
-                }
+        # Unpersist validation_df
+        validation_df.unpersist()
     else:
-        matching_rows = content_df.count()
-        mismatched_rows = 0
-        sample_mismatch = None
+        has_mismatches = False
+        mismatched_df = None
     
-    content_validation_passed = (mismatched_rows == 0)
+    content_validation_passed = not has_mismatches
     
     results["step2_content_validation"] = {
-        "rows_checked": matching_rows + mismatched_rows,
-        "matching_rows": matching_rows,
-        "mismatched_rows": mismatched_rows,
-        "content_validation_passed": content_validation_passed,
-        "sample_mismatch": sample_mismatch
+        "passed": content_validation_passed
     }
     
     if not content_validation_passed:
         results["overall_validation_passed"] = False
-        print(f"Step 2 FAILED: {mismatched_rows} rows have content mismatches")
-        if sample_mismatch:
-            print(f"\nSample mismatched row PK: {sample_mismatch[primary_key]}")
-            print(f"\nLegacy row:")
-            for col, val in sample_mismatch['legacy_row'].items():
-                print(f"  {col}: {val}")
-            print(f"\nDelta row:")
-            for col, val in sample_mismatch['delta_row'].items():
-                print(f"  {col}: {val}")
+        print(f"\nStep 2 FAILED: Content mismatches detected")
+        
+        # Get one sample mismatched row
+        if mismatched_df is not None:
+            legacy_select_cols = [F.col(f"legacy.{c}").alias(f"legacy_{c}") for c in shared_cols]
+            delta_select_cols = [F.col(f"delta.{c}").alias(f"delta_{c}") for c in shared_cols]
+            
+            sample_row = mismatched_df.select(
+                F.col(primary_key),
+                *legacy_select_cols,
+                *delta_select_cols
+            ).first()
+            
+            if sample_row:
+                sample_dict = sample_row.asDict()
+                print(f"\nSample mismatched row (PK: {sample_dict[primary_key]}):")
+                print(f"\nLegacy values:")
+                for k, v in sample_dict.items():
+                    if k.startswith("legacy_"):
+                        print(f"  {k.replace('legacy_', '')}: {v}")
+                print(f"\nDelta values:")
+                for k, v in sample_dict.items():
+                    if k.startswith("delta_"):
+                        print(f"  {k.replace('delta_', '')}: {v}")
         
         # Clean up and return early
         results["execution_time_seconds"] = time.time() - start_time
@@ -301,7 +274,7 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         delta_df.unpersist()
         return results
     else:
-        print(f"Step 2 PASSED: All {matching_rows} rows match")
+        print(f"\nStep 2 PASSED: No content mismatches detected")
     
     # Use content_df for Step 3 (only rows with matching PKs)
     step3_df = content_df
@@ -346,10 +319,11 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     
     # Case 2: legacy.assets is valid
     case2_df = categorized_df.filter(F.col("legacy_assets_valid") == True)
-    case2_total = case2_df.count()
+    case2_has_rows = not case2_df.isEmpty()
     
     # For Case 2, compare legacy.assets with delta.assets (completely order-insensitive)
-    if case2_total > 0:
+    case2_passed = True
+    if case2_has_rows:
         # Get struct fields from legacy.assets and sort them alphabetically
         assets_schema_fields = None
         for field in legacy_df.schema.fields:
@@ -376,31 +350,38 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
                 (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
             )
         
-        case2_passed = case2_comparison.filter(F.col("assets_match") == True).count()
-        case2_failed = case2_total - case2_passed
+        # Check if any failures exist
+        case2_failed_df = case2_comparison.filter(F.col("assets_match") == False)
+        case2_passed = case2_failed_df.isEmpty()
+        
+        # If failed, get one sample row
+        if not case2_passed:
+            sample = case2_failed_df.select(primary_key, "legacy.assets", "delta.assets").first()
+            case2_sample = sample.asDict() if sample else None
+        else:
+            case2_sample = None
     else:
-        case2_passed = 0
-        case2_failed = 0
+        case2_sample = None
     
     # Case 1: legacy.assets is null/empty
     case1_df = categorized_df.filter(F.col("legacy_assets_valid") == False)
     
     # Case 1a: has qualifying INCOME structs
     case1a_df = case1_df.filter(F.col("has_qualifying_income") == True)
-    case1a_total = case1a_df.count()
+    case1a_has_rows = not case1a_df.isEmpty()
     
     # Case 1b: no qualifying INCOME structs
     case1b_df = case1_df.filter(F.col("has_qualifying_income") == False)
-    case1b_total = case1b_df.count()
+    case1b_has_rows = not case1b_df.isEmpty()
     
     # For Case 1a: validate that delta.assets contains mapped structs from qualifying legacy.INCOME
-    # Filter qualifying INCOME structs and map to expected assets format
-    if case1a_total > 0:
+    case1a_passed = True
+    case1a_sample = None
+    if case1a_has_rows:
         # Get the expected field names (delta.assets field names) in alphabetical order
         expected_fields = sorted(income_to_assets_mapping.values())
         
         # Build the struct field mapping expression for the transform
-        # Map from legacy.INCOME to delta.assets field names, but in alphabetical order
         legacy_to_delta_field_map = {v: k for k, v in income_to_assets_mapping.items()}
         mapped_fields = ", ".join([
             f"x.`{legacy_to_delta_field_map[delta_field]}` as `{delta_field}`"
@@ -431,38 +412,62 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
             F.col("expected_assets_normalized") == F.col("delta_assets_normalized")
         )
         
-        case1a_passed = case1a_validation.filter(F.col("assets_match") == True).count()
-        case1a_failed = case1a_total - case1a_passed
-    else:
-        case1a_passed = 0
-        case1a_failed = 0
+        # Check if any failures exist
+        case1a_failed_df = case1a_validation.filter(F.col("assets_match") == False)
+        case1a_passed = case1a_failed_df.isEmpty()
+        
+        # If failed, get one sample row
+        if not case1a_passed:
+            sample = case1a_failed_df.select(primary_key, "legacy.INCOME", "delta.assets", "expected_assets_normalized", "delta_assets_normalized").first()
+            case1a_sample = sample.asDict() if sample else None
     
     # For Case 1b: validate that delta.assets is null or empty
-    if case1b_total > 0:
+    case1b_passed = True
+    case1b_sample = None
+    if case1b_has_rows:
         case1b_comparison = case1b_df.withColumn(
             "delta_assets_null_or_empty",
             F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0)
         )
-        case1b_passed = case1b_comparison.filter(F.col("delta_assets_null_or_empty") == True).count()
-        case1b_failed = case1b_total - case1b_passed
-    else:
-        case1b_passed = 0
-        case1b_failed = 0
+        case1b_failed_df = case1b_comparison.filter(F.col("delta_assets_null_or_empty") == False)
+        case1b_passed = case1b_failed_df.isEmpty()
+        
+        # If failed, get one sample row
+        if not case1b_passed:
+            sample = case1b_failed_df.select(primary_key, "legacy.INCOME", "legacy.assets", "delta.assets").first()
+            case1b_sample = sample.asDict() if sample else None
     
-    assets_income_validation_passed = (case1a_failed == 0 and case1b_failed == 0 and case2_failed == 0)
+    assets_income_validation_passed = (case1a_passed and case1b_passed and case2_passed)
     
     results["step3_assets_income_validation"] = {
-        "case1a": {"total": case1a_total, "passed": case1a_passed, "failed": case1a_failed},
-        "case1b": {"total": case1b_total, "passed": case1b_passed, "failed": case1b_failed},
-        "case2": {"total": case2_total, "passed": case2_passed, "failed": case2_failed},
-        "validation_passed": assets_income_validation_passed
+        "passed": assets_income_validation_passed,
+        "case1a_passed": case1a_passed,
+        "case1b_passed": case1b_passed,
+        "case2_passed": case2_passed
     }
     
     if not assets_income_validation_passed:
         results["overall_validation_passed"] = False
-        print(f"Step 3 FAILED: Assets/INCOME validation issues detected")
+        print(f"\nStep 3 FAILED: Assets/INCOME validation issues detected")
+        
+        if not case1a_passed and case1a_sample:
+            print(f"\n  Case 1a FAILED (PK: {case1a_sample[primary_key]}):")
+            print(f"    legacy.INCOME: {case1a_sample.get('INCOME')}")
+            print(f"    Expected delta.assets: {case1a_sample.get('expected_assets_normalized')}")
+            print(f"    Actual delta.assets: {case1a_sample.get('delta_assets_normalized')}")
+        
+        if not case1b_passed and case1b_sample:
+            print(f"\n  Case 1b FAILED (PK: {case1b_sample[primary_key]}):")
+            print(f"    legacy.INCOME: {case1b_sample.get('INCOME')}")
+            print(f"    legacy.assets: {case1b_sample.get('assets')}")
+            print(f"    delta.assets should be null/empty but is: {case1b_sample.get('assets')}")
+        
+        if not case2_passed and case2_sample:
+            print(f"\n  Case 2 FAILED (PK: {case2_sample[primary_key]}):")
+            print(f"    legacy.assets: {case2_sample.get('assets')}")
+            print(f"    delta.assets: {case2_sample.get('assets')}")
     else:
-        print(f"Step 3 PASSED: All assets and INCOME validations successful")
+        print(f"\nStep 3 PASSED: All assets and INCOME validations successful")
     
     # Unpersist cached DataFrames
     joined_df.unpersist()
