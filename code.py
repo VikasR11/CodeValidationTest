@@ -5,7 +5,7 @@ from typing import Dict, List
 import time
 
 
-def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, skip_pk_validation: bool = False) -> Dict:
+def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, skip_pk_validation: bool = False, repartition: bool = False) -> Dict:
     """
     Validate that delta DataFrame matches legacy DataFrame (source of truth) for 230M rows.
     
@@ -58,11 +58,16 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         "execution_time_seconds": 0
     }
     
-    # Repartition DataFrames once at the beginning for all operations
-    num_partitions = 600  # Optimized for ~200 core cluster
-    print(f"Repartitioning DataFrames into {num_partitions} partitions...")
-    legacy_repartitioned = legacy_df.repartition(num_partitions, primary_key)
-    delta_repartitioned = delta_df.repartition(num_partitions, primary_key)
+    # Optionally repartition DataFrames for better join performance
+    if repartition:
+        num_partitions = 600  # Optimized for ~200 core cluster (3x cores)
+        print(f"Repartitioning DataFrames into {num_partitions} partitions...")
+        legacy_repartitioned = legacy_df.repartition(num_partitions, primary_key)
+        delta_repartitioned = delta_df.repartition(num_partitions, primary_key)
+    else:
+        print(f"Using original partitioning (legacy: {legacy_df.rdd.getNumPartitions()}, delta: {delta_df.rdd.getNumPartitions()})")
+        legacy_repartitioned = legacy_df
+        delta_repartitioned = delta_df
     
     # ========================================
     # STEP 1: Primary Key Validation (Optimized approach)
@@ -218,21 +223,16 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         for condition in comparison_conditions[1:]:
             all_match = all_match & condition
         
-        # Check if there are any mismatches (don't count them - just check existence)
+        # Check if there are any mismatches by trying to get first mismatch
         validation_df = content_df.withColumn("content_matches", all_match)
         
-        # Cache this since we'll use it for both check and sample
-        validation_df.cache()
-        
-        # Check if any mismatches exist (fast - stops at first mismatch)
+        # Try to get first mismatched row - if None, no mismatches exist
         mismatched_df = validation_df.filter(F.col("content_matches") == False)
-        has_mismatches = not mismatched_df.isEmpty()
-        
-        # Unpersist validation_df
-        validation_df.unpersist()
+        first_mismatch = mismatched_df.first()
+        has_mismatches = (first_mismatch is not None)
     else:
         has_mismatches = False
-        mismatched_df = None
+        first_mismatch = None
     
     content_validation_passed = not has_mismatches
     
@@ -244,28 +244,16 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         results["overall_validation_passed"] = False
         print(f"\nStep 2 FAILED: Content mismatches detected")
         
-        # Get one sample mismatched row
-        if mismatched_df is not None:
-            legacy_select_cols = [F.col(f"legacy.{c}").alias(f"legacy_{c}") for c in shared_cols]
-            delta_select_cols = [F.col(f"delta.{c}").alias(f"delta_{c}") for c in shared_cols]
-            
-            sample_row = mismatched_df.select(
-                F.col(primary_key),
-                *legacy_select_cols,
-                *delta_select_cols
-            ).first()
-            
-            if sample_row:
-                sample_dict = sample_row.asDict()
-                print(f"\nSample mismatched row (PK: {sample_dict[primary_key]}):")
-                print(f"\nLegacy values:")
-                for k, v in sample_dict.items():
-                    if k.startswith("legacy_"):
-                        print(f"  {k.replace('legacy_', '')}: {v}")
-                print(f"\nDelta values:")
-                for k, v in sample_dict.items():
-                    if k.startswith("delta_"):
-                        print(f"  {k.replace('delta_', '')}: {v}")
+        # Use the first_mismatch we already retrieved
+        if first_mismatch:
+            sample_dict = first_mismatch.asDict()
+            print(f"\nSample mismatched row (PK: {sample_dict[primary_key]}):")
+            print(f"\nLegacy values:")
+            for col in shared_cols:
+                print(f"  {col}: {sample_dict.get(f'legacy.{col}')}")
+            print(f"\nDelta values:")
+            for col in shared_cols:
+                print(f"  {col}: {sample_dict.get(f'delta.{col}')}")
         
         # Clean up and return early
         results["execution_time_seconds"] = time.time() - start_time
@@ -319,10 +307,12 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     
     # Case 2: legacy.assets is valid
     case2_df = categorized_df.filter(F.col("legacy_assets_valid") == True)
-    case2_has_rows = not case2_df.isEmpty()
+    # Try to get first row - if None, no rows exist
+    case2_has_rows = (case2_df.first() is not None)
     
     # For Case 2, compare legacy.assets with delta.assets (completely order-insensitive)
     case2_passed = True
+    case2_sample = None
     if case2_has_rows:
         # Get struct fields from legacy.assets and sort them alphabetically
         assets_schema_fields = None
@@ -350,29 +340,25 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
                 (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
             )
         
-        # Check if any failures exist
+        # Check if any failures exist by trying to get first failure
         case2_failed_df = case2_comparison.filter(F.col("assets_match") == False)
-        case2_passed = case2_failed_df.isEmpty()
+        first_failure = case2_failed_df.first()
+        case2_passed = (first_failure is None)
         
-        # If failed, get one sample row
+        # If failed, use the first_failure we already have
         if not case2_passed:
-            sample = case2_failed_df.select(primary_key, "legacy.assets", "delta.assets").first()
-            case2_sample = sample.asDict() if sample else None
-        else:
-            case2_sample = None
-    else:
-        case2_sample = None
+            case2_sample = first_failure.asDict() if first_failure else None
     
     # Case 1: legacy.assets is null/empty
     case1_df = categorized_df.filter(F.col("legacy_assets_valid") == False)
     
     # Case 1a: has qualifying INCOME structs
     case1a_df = case1_df.filter(F.col("has_qualifying_income") == True)
-    case1a_has_rows = not case1a_df.isEmpty()
+    case1a_has_rows = (case1a_df.first() is not None)
     
     # Case 1b: no qualifying INCOME structs
     case1b_df = case1_df.filter(F.col("has_qualifying_income") == False)
-    case1b_has_rows = not case1b_df.isEmpty()
+    case1b_has_rows = (case1b_df.first() is not None)
     
     # For Case 1a: validate that delta.assets contains mapped structs from qualifying legacy.INCOME
     case1a_passed = True
@@ -412,14 +398,14 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
             F.col("expected_assets_normalized") == F.col("delta_assets_normalized")
         )
         
-        # Check if any failures exist
+        # Check if any failures exist by trying to get first failure
         case1a_failed_df = case1a_validation.filter(F.col("assets_match") == False)
-        case1a_passed = case1a_failed_df.isEmpty()
+        first_failure = case1a_failed_df.first()
+        case1a_passed = (first_failure is None)
         
-        # If failed, get one sample row
+        # If failed, use the first_failure we already have
         if not case1a_passed:
-            sample = case1a_failed_df.select(primary_key, "legacy.INCOME", "delta.assets", "expected_assets_normalized", "delta_assets_normalized").first()
-            case1a_sample = sample.asDict() if sample else None
+            case1a_sample = first_failure.asDict() if first_failure else None
     
     # For Case 1b: validate that delta.assets is null or empty
     case1b_passed = True
@@ -430,12 +416,12 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
             F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0)
         )
         case1b_failed_df = case1b_comparison.filter(F.col("delta_assets_null_or_empty") == False)
-        case1b_passed = case1b_failed_df.isEmpty()
+        first_failure = case1b_failed_df.first()
+        case1b_passed = (first_failure is None)
         
-        # If failed, get one sample row
+        # If failed, use the first_failure we already have
         if not case1b_passed:
-            sample = case1b_failed_df.select(primary_key, "legacy.INCOME", "legacy.assets", "delta.assets").first()
-            case1b_sample = sample.asDict() if sample else None
+            case1b_sample = first_failure.asDict() if first_failure else None
     
     assets_income_validation_passed = (case1a_passed and case1b_passed and case2_passed)
     
