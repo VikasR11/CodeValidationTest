@@ -130,26 +130,23 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
                 # Get field names from legacy HOUSING schema (excluding HOUSING_TYPE)
                 legacy_housing_fields = [f.name for f in col_type.elementType.fields]
                 
-                # Create expression to transform delta.HOUSING, selecting only fields that exist in legacy
+                # Create full expression for delta HOUSING: filter fields, convert to JSON, sort
                 field_selections = ", ".join([f"x.{field} as {field}" for field in legacy_housing_fields])
-                delta_filtered = F.expr(f"transform(`delta`.`HOUSING`, x -> struct({field_selections}))")
                 
-                # For order-insensitive comparison, compare sorted arrays of JSON strings
-                legacy_json_array = F.expr(f"transform(`legacy`.`{col_name}`, x -> to_json(x))")
-                delta_json_array = F.expr(f"transform({delta_filtered}, x -> to_json(x))")
+                # Build complete expressions for both sides
+                legacy_expr = F.expr(f"array_sort(transform(`legacy`.`{col_name}`, x -> to_json(x)))")
+                delta_expr = F.expr(f"array_sort(transform(transform(`delta`.`{col_name}`, x -> struct({field_selections})), y -> to_json(y)))")
                 
-                # Sort both arrays and compare
-                return (F.array_sort(legacy_json_array) == F.array_sort(delta_json_array)) | \
+                return (legacy_expr == delta_expr) | \
                        (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
             
             elif isinstance(col_type.elementType, StructType):
                 # For arrays of structs, convert each struct to JSON string, sort array, then compare
                 # This handles order within array AND ensures struct field order doesn't matter
-                legacy_json_array = F.expr(f"transform(`legacy`.`{col_name}`, x -> to_json(x))")
-                delta_json_array = F.expr(f"transform(`delta`.`{col_name}`, x -> to_json(x))")
+                legacy_json_array = F.expr(f"array_sort(transform(`legacy`.`{col_name}`, x -> to_json(x)))")
+                delta_json_array = F.expr(f"array_sort(transform(`delta`.`{col_name}`, x -> to_json(x)))")
                 
-                # Sort both arrays and compare
-                return (F.array_sort(legacy_json_array) == F.array_sort(delta_json_array)) | \
+                return (legacy_json_array == delta_json_array) | \
                        (F.col(f"legacy.{col_name}").isNull() & F.col(f"delta.{col_name}").isNull())
             else:
                 # For arrays of primitives, use simple array_sort
