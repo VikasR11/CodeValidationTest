@@ -5,6 +5,35 @@ from pyspark import StorageLevel
 from typing import Dict
 import time
 
+'''
+Case 1: legacy.assets is null/empty/missing
+Case 1a: legacy.assets is null/empty AND qualifying INCOME exists
+
+"Qualifying INCOME" = INCOME structs with non-null ASSETS_AMOUNT or UNTAXED_INCOME_AMOUNT
+Expected: delta.assets should contain mapped structs from those qualifying INCOME structs
+Mapping: INCOME fields → assets fields
+
+INCM_SOURCE → assets_source
+INCOME_CHANNEL_NAME → assets_channel_name
+STRATEGY_NAME → assets_strategy_name
+INCOME_LAST_MODIFIED_SOURCE_SYSTEM → assets_last_modified_source_system
+INCOME_REPORTED_TS → assets_reported_utc_timestamp
+ASSETS_AMOUNT → assets_amount
+UNTAXED_INCOME_AMOUNT → untaxed_income_amount
+
+
+
+Case 1b: legacy.assets is null/empty AND no qualifying INCOME
+
+No INCOME structs have non-null ASSETS_AMOUNT or UNTAXED_INCOME_AMOUNT
+OR ASSETS_AMOUNT/UNTAXED_INCOME_AMOUNT fields don't exist in schema
+Expected: delta.assets should be null or empty
+
+Case 2: legacy.assets is valid (not null/empty)
+
+Expected: delta.assets should match legacy.assets exactly (order-insensitive)
+'''
+
 
 def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, materialize_inputs: bool = True) -> Dict:
     """Validate delta DataFrame matches legacy DataFrame (source of truth)."""
