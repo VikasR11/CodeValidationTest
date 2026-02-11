@@ -6,7 +6,7 @@ from typing import Dict, List
 import time
 
 
-def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, num_partitions: int = 0, materialize_inputs: bool = True) -> Dict:
+def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_key: str, num_partitions: int = 300, materialize_inputs: bool = True) -> Dict:
     """
     Validate that delta DataFrame matches legacy DataFrame (source of truth) for 230M rows.
     
@@ -25,7 +25,8 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         legacy_df: Source of truth DataFrame in Parquet format
         delta_df: Modern DataFrame in Delta Lake format (or transformed parquet)
         primary_key: Single column name to use as primary key
-        num_partitions: Number of partitions to repartition to (default: 0 = no repartitioning). 
+        num_partitions: Number of partitions to repartition to (default: 300). 
+                       Set to 0 to skip repartitioning and use original partitioning.
                        Try 300-400 for 200-core cluster with complex nested data.
         materialize_inputs: Cache and materialize inputs to avoid lineage issues (default: True)
     
@@ -38,20 +39,12 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
     # Materialize inputs to avoid lineage explosion issues
     # This is critical when delta_df is a transformed parquet with long lineage
     if materialize_inputs:
-        print("Materializing input DataFrames to avoid lineage issues...")
+        print("Materializing input DataFrames (lazy - will materialize on first operation)...")
         legacy_df.persist(StorageLevel.MEMORY_AND_DISK)
         delta_df.persist(StorageLevel.MEMORY_AND_DISK)
-        
-        # Try to force evaluation with count() - if it fails, caching will happen on first use
-        try:
-            legacy_count = legacy_df.count()
-            delta_count = delta_df.count()
-            print(f"Materialized: legacy ({legacy_count:,} rows), delta ({delta_count:,} rows)")
-        except Exception as e:
-            print(f"Note: Could not count rows (will materialize on first operation): {str(e)[:100]}")
-            print("Continuing with lazy materialization...")
+        print("Persist marked - caching will occur on first use")
     else:
-        # Still cache for efficiency even if not forcing materialization
+        # Still cache for efficiency
         legacy_df.persist(StorageLevel.MEMORY_AND_DISK)
         delta_df.persist(StorageLevel.MEMORY_AND_DISK)
     
@@ -89,29 +82,25 @@ def compare_legacy_vs_delta(legacy_df: DataFrame, delta_df: DataFrame, primary_k
         delta_repartitioned = delta_df
     
     # ========================================
-    # STEP 1: Primary Key Validation (Optimized approach)
-    # ========================================
-    # STEP 1: Primary Key Validation (Optimized approach)
+    # STEP 1: Primary Key Validation (Simplified approach)
     # ========================================
     print("Starting Step 1: PK Validation...")
     
-    # Fast PK validation using union + groupBy
-    # If PKs match, each PK will have src values {1, 2}
-    # If PKs don't match, some PKs will have only src=1 or src=2
-    legacy_keys = legacy_repartitioned.select(primary_key).withColumn("src", F.lit(1))
-    delta_keys = delta_repartitioned.select(primary_key).withColumn("src", F.lit(2))
+    # Check if there are PKs in legacy not in delta (missing in delta)
+    print("Checking for PKs missing in delta...")
+    missing_in_delta = legacy_repartitioned.select(primary_key).subtract(
+        delta_repartitioned.select(primary_key)
+    ).first()
+    has_missing = (missing_in_delta is not None)
     
-    print("Checking for PK mismatches...")
-    mismatched_pks = (
-        legacy_keys.unionByName(delta_keys)
-        .groupBy(primary_key)
-        .agg(F.countDistinct("src").alias("c"))
-        .filter(F.col("c") != 2)
-        .limit(1)
-        .take(1)  # Returns empty list if no mismatches
-    )
+    # Check if there are PKs in delta not in legacy (extra in delta)
+    print("Checking for extra PKs in delta...")
+    extra_in_delta = delta_repartitioned.select(primary_key).subtract(
+        legacy_repartitioned.select(primary_key)
+    ).first()
+    has_extra = (extra_in_delta is not None)
     
-    pks_match = len(mismatched_pks) == 0
+    pks_match = not (has_missing or has_extra)
     
     if not pks_match:
         print("Step 1 FAILED: PKs do not match")
