@@ -238,6 +238,7 @@ def compare_legacy_vs_delta(
     )
     
     # Case 1a: delta.assets should match mapped INCOME fields
+    # Only build this expression if qualifying fields actually exist in INCOME schema
     if quals:
         step3_df = step3_df.withColumn(
             "case1a_valid",
@@ -248,6 +249,8 @@ def compare_legacy_vs_delta(
             ).otherwise(F.lit(True))
         )
     else:
+        # ASSETS_AMOUNT and UNTAXED_INCOME_AMOUNT don't exist in INCOME schema
+        # No rows can qualify for Case 1a - skip entirely
         step3_df = step3_df.withColumn("case1a_valid", F.lit(True))
     
     # Case 2: delta.assets should match legacy.assets
