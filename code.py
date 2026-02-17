@@ -99,7 +99,6 @@ def compare_legacy_vs_delta(
     if not shared_cols:
         print("No shared columns")
         results["step2_content_validation"] = {"passed": True}
-        joined = None
     else:
         joined = leg.alias("legacy").join(dlt.alias("delta"), on=primary_key, how="inner")
         
@@ -176,10 +175,16 @@ def compare_legacy_vs_delta(
     # ========== STEP 3: ASSETS/INCOME VALIDATION ==========
     print("\nStep 3: Assets/INCOME Validation...")
     
-    # Create or reuse join
-    if joined is None:
-        joined = leg.alias("legacy").join(dlt.alias("delta"), on=primary_key, how="inner")
+    # Narrow to only columns needed for Step 3 to reduce memory pressure
+    # Keep: PK, legacy.INCOME, legacy.assets (if exists), delta.assets
+    legacy_step3_cols = [primary_key, "INCOME"] + (["assets"] if has_assets else [])
+    delta_step3_cols = [primary_key, "assets"]
     
+    leg_narrow = leg.select(*legacy_step3_cols)
+    dlt_narrow = dlt.select(*delta_step3_cols)
+    
+    # Join narrow DataFrames
+    joined = leg_narrow.alias("legacy").join(dlt_narrow.alias("delta"), on=primary_key, how="inner")
     joined = joined.coalesce(200).persist(StorageLevel.MEMORY_AND_DISK)
     
     # Get INCOME fields
