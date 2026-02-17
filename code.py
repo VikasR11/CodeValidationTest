@@ -249,8 +249,14 @@ def compare_legacy_vs_delta(
             "case1a_valid",
             F.when(
                 (~F.col("leg_valid")) & F.col("has_qual"),
-                F.expr(f"array_sort(transform(filter(`legacy`.`INCOME`, x -> {qual_expr}), x -> to_json(struct({mapped}))))") ==
-                F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({dlt_norm}))))")
+                # If delta.assets is null when we expect mapped values, that's a failure
+                F.when(
+                    F.col("delta.assets").isNull(),
+                    F.lit(False)
+                ).otherwise(
+                    F.expr(f"array_sort(transform(filter(`legacy`.`INCOME`, x -> {qual_expr}), x -> to_json(struct({mapped}))))") ==
+                    F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({dlt_norm}))))")
+                )
             ).otherwise(F.lit(True))
         )
     else:
@@ -265,9 +271,13 @@ def compare_legacy_vs_delta(
             "case2_valid",
             F.when(
                 F.col("leg_valid"),
-                (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({fs}))))") ==
-                 F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({fs}))))")) |
-                (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
+                # Handle null comparisons explicitly - coalesce to False if comparison is null
+                F.coalesce(
+                    (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({fs}))))") ==
+                     F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({fs}))))")) |
+                    (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull()),
+                    F.lit(False)
+                )
             ).otherwise(F.lit(True))
         )
     else:
