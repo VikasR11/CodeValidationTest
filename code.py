@@ -210,63 +210,88 @@ def compare_legacy_vs_delta(
         cat = joined.withColumn("leg_valid", F.lit(False)) \
                     .withColumn("has_qual", F.expr(f"exists(`legacy`.`INCOME`, x -> {qual_expr})"))
     
-    # Case 2: legacy.assets valid
-    case2_pass = True
-    if has_assets:
-        c2_filter = cat.filter(F.col("leg_valid"))
-        
-        # Get asset fields
-        asset_fields = None
-        for f in legacy_df.schema.fields:
-            if f.name == "assets" and isinstance(f.dataType, ArrayType):
-                asset_fields = sorted([sf.name for sf in f.dataType.elementType.fields])
-                break
-        
-        if asset_fields:
-            fs = ", ".join([f"x.`{f}` as `{f}`" for f in asset_fields])
-            c2 = c2_filter.withColumn(
-                "match",
-                (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({fs}))))") ==
-                 F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({fs}))))")) |
-                (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
-            )
-            # Check for failures - .first() on filtered failures (should be None if no rows or all pass)
-            case2_fail = c2.filter(~F.col("match")).first()
-            case2_pass = (case2_fail is None)
-    
-    # Case 1a: legacy.assets invalid, has qualifying income
-    case1a_pass = True
-    c1a_filter = cat.filter((~F.col("leg_valid")) & F.col("has_qual"))
+    # Compute all case validations in a SINGLE pass with one .first() call
+    # This avoids multiple expensive .first() calls on complex expressions
     
     exp_fields = sorted(income_to_assets.values())
     l2d = {v: k for k, v in income_to_assets.items()}
     mapped = ", ".join([f"x.`{l2d[d]}` as `{d}`" for d in exp_fields])
     dlt_norm = ", ".join([f"x.`{f}` as `{f}`" for f in exp_fields])
     
-    c1a = c1a_filter.withColumn(
-        "exp",
-        F.expr(f"array_sort(transform(filter(`legacy`.`INCOME`, x -> {qual_expr}), x -> to_json(struct({mapped}))))")
-    ).withColumn(
-        "dlt_norm",
-        F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({dlt_norm}))))")
+    asset_fields = None
+    if has_assets:
+        for f in legacy_df.schema.fields:
+            if f.name == "assets" and isinstance(f.dataType, ArrayType):
+                asset_fields = sorted([sf.name for sf in f.dataType.elementType.fields])
+                break
+    
+    # Build all case columns at once
+    step3_df = cat
+    
+    # Case 1b: delta.assets should be null/empty
+    step3_df = step3_df.withColumn(
+        "case1b_valid",
+        F.when(
+            (~F.col("leg_valid")) & (~F.col("has_qual")),
+            F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0)
+        ).otherwise(F.lit(True))
     )
-    # Check for failures
-    case1a_fail = c1a.filter(F.col("exp") != F.col("dlt_norm")).first()
-    case1a_pass = (case1a_fail is None)
     
-    # Case 1b: legacy.assets invalid, no qualifying income
-    case1b_pass = True
-    c1b_filter = cat.filter((~F.col("leg_valid")) & (~F.col("has_qual")))
+    # Case 1a: delta.assets should match mapped INCOME fields
+    if quals:
+        step3_df = step3_df.withColumn(
+            "case1a_valid",
+            F.when(
+                (~F.col("leg_valid")) & F.col("has_qual"),
+                F.expr(f"array_sort(transform(filter(`legacy`.`INCOME`, x -> {qual_expr}), x -> to_json(struct({mapped}))))") ==
+                F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({dlt_norm}))))")
+            ).otherwise(F.lit(True))
+        )
+    else:
+        step3_df = step3_df.withColumn("case1a_valid", F.lit(True))
     
-    c1b = c1b_filter.withColumn(
-        "null_empty",
-        F.isnull(F.col("delta.assets")) | (F.size(F.col("delta.assets")) == 0)
+    # Case 2: delta.assets should match legacy.assets
+    if asset_fields:
+        fs = ", ".join([f"x.`{f}` as `{f}`" for f in asset_fields])
+        step3_df = step3_df.withColumn(
+            "case2_valid",
+            F.when(
+                F.col("leg_valid"),
+                (F.expr(f"array_sort(transform(`legacy`.`assets`, x -> to_json(struct({fs}))))") ==
+                 F.expr(f"array_sort(transform(`delta`.`assets`, x -> to_json(struct({fs}))))")) |
+                (F.col("legacy.assets").isNull() & F.col("delta.assets").isNull())
+            ).otherwise(F.lit(True))
+        )
+    else:
+        step3_df = step3_df.withColumn("case2_valid", F.lit(True))
+    
+    # Single combined column - any row failing ANY case
+    step3_df = step3_df.withColumn(
+        "step3_valid",
+        F.col("case1a_valid") & F.col("case1b_valid") & F.col("case2_valid")
     )
-    # Check for failures
-    case1b_fail = c1b.filter(~F.col("null_empty")).first()
-    case1b_pass = (case1b_fail is None)
     
-    step3_pass = case1a_pass and case1b_pass and case2_pass
+    # ONE .first() call to find any failure
+    try:
+        step3_fail = step3_df.filter(~F.col("step3_valid")).first()
+        
+        if step3_fail is None:
+            case1a_pass = True
+            case1b_pass = True
+            case2_pass = True
+        else:
+            row = step3_fail.asDict()
+            case1a_pass = bool(row.get("case1a_valid", True))
+            case1b_pass = bool(row.get("case1b_valid", True))
+            case2_pass = bool(row.get("case2_valid", True))
+            print(f"  Failing row PK: {row.get(primary_key)}")
+    except Exception as e:
+        print(f"  ERROR: Step 3 validation failed to execute: {str(e)[:150]}")
+        case1a_pass = None
+        case1b_pass = None
+        case2_pass = None
+    
+    step3_pass = None if case1a_pass is None else (case1a_pass and case1b_pass and case2_pass)
     
     results["step3_assets_income_validation"] = {
         "passed": step3_pass,
@@ -275,7 +300,10 @@ def compare_legacy_vs_delta(
         "case2_passed": case2_pass
     }
     
-    if not step3_pass:
+    if step3_pass is None:
+        print("Step 3 INCOMPLETE - Could not execute validation")
+        results["overall_validation_passed"] = False
+    elif not step3_pass:
         print("Step 3 FAILED")
         print(f"  Case 1a: {'PASS' if case1a_pass else 'FAIL'}")
         print(f"  Case 1b: {'PASS' if case1b_pass else 'FAIL'}")
