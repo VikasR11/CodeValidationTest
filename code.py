@@ -195,12 +195,23 @@ def compare_legacy_vs_delta(
             break
     
     # Build qualifying condition
-    quals = []
+    # Qualifying = (ASSETS_AMOUNT not null OR UNTAXED_INCOME_AMOUNT not null) AND INCM_SOURCE == "CUSTOMER_PROVIDED"
+    amount_quals = []
     if "ASSETS_AMOUNT" in income_fields:
-        quals.append("x.ASSETS_AMOUNT is not null")
+        amount_quals.append("x.ASSETS_AMOUNT is not null")
     if "UNTAXED_INCOME_AMOUNT" in income_fields:
-        quals.append("x.UNTAXED_INCOME_AMOUNT is not null")
-    qual_expr = " or ".join(quals) if quals else "false"
+        amount_quals.append("x.UNTAXED_INCOME_AMOUNT is not null")
+    
+    if amount_quals and "INCM_SOURCE" in income_fields:
+        # Both amount fields check AND source check
+        amount_expr = " or ".join(amount_quals)
+        qual_expr = f"({amount_expr}) and x.INCM_SOURCE == 'CUSTOMER_PROVIDED'"
+    elif amount_quals:
+        # Only amount fields exist, no source check
+        qual_expr = " or ".join(amount_quals)
+    else:
+        # No qualifying fields exist
+        qual_expr = "false"
     
     # Categorize
     if has_assets:
@@ -244,7 +255,7 @@ def compare_legacy_vs_delta(
     
     # Case 1a: delta.assets should match mapped INCOME fields
     # Only build this expression if qualifying fields actually exist in INCOME schema
-    if quals:
+    if amount_quals:
         step3_df = step3_df.withColumn(
             "case1a_valid",
             F.when(
